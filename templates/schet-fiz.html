@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Счет на оплату</title>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+* { box-sizing: border-box; }
+body { font-family: 'Montserrat', Arial, sans-serif; font-size: 8.5pt; margin: 5mm; line-height: 1.2; color: #1a1a1a; }
+.header { text-align: center; font-weight: 700; font-size: 10pt; margin-bottom: 6px; }
+.header-logo { max-height: 50px; margin-bottom: 5px; display: block; margin-left: auto; margin-right: auto; }
+.doc-meta { text-align: right; font-size: 8.5pt; margin-bottom: 10px; line-height: 1.3; }
+.period-block { text-align: right; font-size: 8.5pt; margin-bottom: 8px; color: #444; }
+.intro-text { font-size: 8pt; text-align: justify; margin-bottom: 8px; line-height: 1.2; }
+.party-block { margin-bottom: 6px; line-height: 1.25; font-size: 8pt; }
+.party-block b { font-weight: 600; }
+.divider { border: none; border-top: 1.5px solid #333; margin: 8px 0; }
+.section-title { font-weight: 700; font-size: 8.5pt; margin-top: 10px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.3px; }
+table { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 7.5pt; }
+th, td { border: 1px solid #333; padding: 2px 3px; vertical-align: middle; }
+th { background: #f0f0f0; font-weight: 600; text-align: center; font-size: 7pt; }
+.text-right { text-align: right; }
+.text-center { text-align: center; }
+.total-row { font-weight: 600; }
+.vat-note { margin: 4px 0; font-size: 7.5pt; font-style: italic; color: #444; }
+.sum-words { margin: 6px 0 8px 0; font-weight: 600; font-size: 8.5pt; }
+.contacts-block { font-size: 8pt; line-height: 1.3; margin-top: 8px; }
+.contacts-block b { font-weight: 600; }
+.legal-text { margin: 4px 0; text-align: justify; font-size: 7.5pt; line-height: 1.2; }
+.legal-text p { margin: 3px 0; }
+.signatures { margin-top: 15px; display: flex; justify-content: flex-start; gap: 10px; font-size: 8pt; }
+.signature-block { width: 50%; line-height: 1.3; }
+.stamp-wrapper { position: relative; display: inline-block; }
+.stamp-img { display: none; position: absolute; top: -40px; left: 55px; width: 39mm; height: auto; opacity: 0.85; transform: rotate(-12deg); mix-blend-mode: multiply; pointer-events: none; z-index: 10; }
+.exec-sign-line { display: flex; align-items: flex-end; padding: 1px 5px 2px 5px; min-height: 18px; font-weight: 500; }
+.exec-sign-gap { border-bottom: 1px solid #000; width: 4cm; flex-shrink: 0; margin: 0 5px; }
+
+/* 🆕 Стили для новых блоков */
+.materials-disclaimer { margin-top: 6px; font-size: 7.5pt; font-style: italic; color: #555; line-height: 1.2; }
+.doc-notes-block { margin-top: 10px; margin-bottom: 10px; font-size: 8pt; line-height: 1.4; }
+/* 🆕 Стили для Markdown в примечаниях */
+.doc-notes-block p { margin: 3px 0; }
+.doc-notes-block ul, .doc-notes-block ol { margin: 3px 0 3px 18px; padding: 0; }
+.doc-notes-block li { margin: 2px 0; }
+.doc-notes-block strong { font-weight: 700; }
+.doc-notes-block em { font-style: italic; }
+.doc-notes-block br { margin: 0; }
+
+@media print { body { margin: 5mm; } @page { size: A4; margin: 5mm; } }
+</style>
+</head>
+<body>
+
+<!-- 🛡️ Overlay: показывается до завершения проверки -->
+<div id="loading-overlay" style="position:fixed;inset:0;background:#fff;z-index:9999;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;">
+    <div style="width:40px;height:40px;border:4px solid #e0e0e0;border-top-color:#e74c3c;border-radius:50%;animation:spin .8s linear infinite;"></div>
+    <span style="color:#7f8c8d;font-family:'Segoe UI',sans-serif;font-size:14px;">Загрузка документа...</span>
+</div>
+<style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+
+<div class="header">
+    <img id="companyLogo" class="header-logo" style="display: none;" alt="Логотип">
+    <span id="docTitle">Счет на оплату</span> № <span id="docNumber"></span> от <span id="docDate"></span>
+</div>
+<div class="doc-meta" id="docPlace"></div>
+
+<!-- 🆕 ПЕРИОД -->
+<div id="periodBlock" class="period-block" style="display: none;">
+    <b>Период:</b> <span id="periodText"></span>
+</div>
+
+<div class="intro-text" id="introText"></div>
+
+<!-- 🏢 ИСПОЛНИТЕЛЬ -->
+<div class="party-block">
+    <b><span id="party1Name">Исполнитель</span>:</b> <span id="myName"></span> &nbsp;|&nbsp; <b>УНП:</b> <span id="myUNP"></span><br>
+    <b>Адрес:</b> <span id="myAddress"></span><br>
+    <b>Тел:</b> <span id="myPhone"></span> &nbsp;|&nbsp; <b>Email:</b> <span id="myEmail"></span><br>
+    <b>р/с:</b> <span id="myAccount"></span> в <span id="myBank"></span> &nbsp;|&nbsp; <b>БИК:</b> <span id="myBIK"></span>
+</div>
+<hr class="divider">
+
+<!-- 👤 ЗАКАЗЧИК (Динамический блок только для B2C) -->
+<div class="party-block">
+    <b><span id="party2Name">Заказчик</span>:</b> <span id="clientName"></span><br>
+    <div id="clientDetailsBlock" style="margin-top: 4px;"></div>
+</div>
+
+<div class="section-title">Предмет и стоимость</div>
+<table>
+    <thead>
+        <tr>
+            <th style="width:4%">№</th>
+            <th style="width:30%">Наименование</th>
+            <th style="width:8%">Ед. изм.</th>
+            <th style="width:8%">Кол-во</th>
+            <th style="width:15%">Цена, руб. коп.</th>
+            <th style="width:15%">Сумма, руб. коп.</th>
+            <th style="width:10%">НДС</th>
+            <th style="width:10%">Всего, руб. коп.</th>
+        </tr>
+    </thead>
+    <tbody id="works"></tbody>
+    <tfoot>
+        <tr class="total-row">
+            <td colspan="5" style="text-align: right; font-weight: 600;">ИТОГО:</td>
+            <td class="text-right" id="totalSum"></td>
+            <td style="text-align: center;">x</td>
+            <td class="text-right" id="totalWithVAT"></td>
+        </tr>
+    </tfoot>
+</table>
+
+<!-- 🆕 МАТЕРИАЛЫ ЗАКАЗЧИКА -->
+<div id="customerMaterialsBlock" style="display: none; margin-top: 10px;">
+    <div class="section-title">Материалы заказчика</div>
+    <table>
+        <thead>
+            <tr>
+                <th style="width:4%">№</th>
+                <th style="width:40%">Наименование</th>
+                <th style="width:10%">Ед. изм.</th>
+                <th style="width:10%">Кол-во</th>
+                <th style="width:36%">Примечание</th>
+            </tr>
+        </thead>
+        <tbody id="customerMaterialsTable"></tbody>
+    </table>
+    <div id="materialsDisclaimer" class="materials-disclaimer" style="display: none;"></div>
+</div>
+
+<div class="vat-note" id="vatNote" style="display: none;"></div>
+<div class="sum-words">Всего к оплате: <span id="sumWords"></span></div>
+
+<!-- 🆕 ПРИМЕЧАНИЯ К ДОКУМЕНТУ (после суммы прописью, без заголовка, с Markdown) -->
+<div id="docNotesBlock" class="doc-notes-block" style="display: none;">
+    <div id="docNotesText"></div>
+</div>
+
+<!-- 📞 БЛОК КОНТАКТОВ (упрощённый для B2C, управляется настройками) -->
+<div id="contactsSection" style="display: none;">
+    <div class="section-title">Контакты</div>
+    <div class="contacts-block">
+        <b>По вопросам заказа:</b> <span id="executorContact"></span> | <span id="myEmailLegal"></span>
+    </div>
+</div>
+
+<div class="section-title">Условия</div>
+<div class="legal-text" id="legalConditions"></div>
+
+<div class="signatures">
+    <div class="signature-block">
+        <b><span id="signPartyName">Исполнитель</span>:</b><br>
+        <div class="stamp-wrapper">
+            <div class="exec-sign-line"><span id="signTitle"></span><span class="exec-sign-gap"></span><span id="signName"></span></div>
+            <div style="font-size: 6.5pt; color: #444; margin-top: 2px; text-align: center;">(должность, ФИО, подпись)</div>
+            <img src="/img/stamp.png" alt="Печать" class="stamp-img" id="stampImg">
+        </div>
+    </div>
+</div>
+
+<script>
+// 🛡️ 1. ЗАЩИТА API: Перехватываем fetch и добавляем secret
+(function() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const SECRET = urlParams.get('secret');
+    if (!SECRET) {
+        document.body.innerHTML = `<div style="padding:40px;text-align:center;font-family:sans-serif;"><h1>🔒 Доступ запрещён</h1><p>Отсутствует секретный ключ в URL. Откройте документ через формулу-кнопку в NocoDB.</p></div>`;
+        throw new Error('Missing secret parameter');
+    }
+    const originalFetch = window.fetch;
+    window.fetch = function(url, options = {}) {
+        if (typeof url === 'string' && url.startsWith('/api/')) {
+            const separator = url.includes('?') ? '&' : '?';
+            url = url + separator + 'secret=' + encodeURIComponent(SECRET);
+        }
+        return originalFetch(url, options);
+    };
+})();
+
+marked.setOptions({ breaks: true, gfm: true, headerIds: false, mangle: false });
+
+const params = new URLSearchParams(window.location.search);
+const docId = params.get('doc');
+
+if (!docId || docId === 'ID' || isNaN(parseInt(docId))) {
+    document.body.innerHTML = '<h2>Ошибка: некорректный ID документа</h2>';
+} else {
+    loadData();
+}
+
+async function loadData() {
+    try {
+        const docRes = await fetch(`/api/doc/${docId}`);
+        if (!docRes.ok) throw new Error('Ошибка загрузки данных');
+        const docData = await docRes.json();
+        const doc = docData.list ? docData.list[0] : docData;
+
+        // 🛡️ Ранняя проверка: привязан ли документ к проекту
+        let projectId = null;
+        const projectField = doc['Проект'];
+        if (projectField) {
+            if (Array.isArray(projectField)) projectId = projectField[0]?.Id || projectField[0];
+            else if (typeof projectField === 'object') projectId = projectField.Id;
+            else projectId = projectField;
+        }
+        if (!projectId) throw new Error('Документ не привязан к проекту');
+
+        const [myRes, settingsRes] = await Promise.all([
+            fetch('/api/my-details'),
+            fetch('/api/doc-settings')
+        ]);
+
+        if (!myRes.ok) throw new Error('Ошибка загрузки данных');
+
+        const myData = await myRes.json();
+        const my = myData.list ? myData.list[0] : myData;
+
+        const settingsData = await settingsRes.json();
+        const settings = settingsData.list ? settingsData.list[0] : settingsData;
+
+        const projectRes = await fetch(`/api/project/${projectId}`);
+        const projectData = projectRes.ok ? await projectRes.json() : {};
+        const project = projectData.list ? projectData.list[0] : projectData;
+
+        let contactId = null;
+        const контактField = project['Контакт'];
+        if (контактField) contactId = Array.isArray(контактField) ? контактField[0]?.Id : (typeof контактField === 'object' ? контактField.Id : контактField);
+
+        let managerId = null;
+        const менеджерField = project['Менеджер'];
+        if (менеджерField) managerId = Array.isArray(менеджерField) ? менеджерField[0]?.Id : (typeof менеджерField === 'object' ? менеджерField.Id : менеджерField);
+
+        let signerId = null;
+        const signerField = doc['Подписант документа'] || settings['Подписант'];
+        if (signerField) {
+            signerId = Array.isArray(signerField) ? signerField[0]?.Id : (typeof signerField === 'object' ? signerField.Id : signerField);
+        }
+
+        const [контакт, менеджер, signer] = await Promise.all([
+            contactId ? fetch(`/api/contact/${contactId}`).then(r => r.ok ? r.json() : {}).then(d => d.list ? d.list[0] : d) : Promise.resolve({}),
+            managerId ? fetch(`/api/employee/${managerId}`).then(r => r.ok ? r.json() : {}).then(d => d.list ? d.list[0] : d) : Promise.resolve({}),
+            signerId ? fetch(`/api/employee/${signerId}`).then(r => r.ok ? r.json() : {}).then(d => d.list ? d.list[0] : d) : Promise.resolve({})
+        ]);
+
+        const itemsRes = await fetch('/api/items');
+        const allItems = itemsRes.ok ? (await itemsRes.json()).list || [] : [];
+        
+        // 🆕 Фильтруем позиции проекта и разделяем на обычные и материалы заказчика
+        const projectItems = allItems.filter(w => {
+            return w['Проекты'] && (w['Проекты'].Id == projectId || (Array.isArray(w['Проекты']) && w['Проекты'].some(p => p.Id == projectId)));
+        });
+        
+        const regularItems = projectItems.filter(w => w['Тип'] !== 'Мат. заказчика');
+        const customerMaterials = projectItems.filter(w => w['Тип'] === 'Мат. заказчика');
+        
+        renderDocument(doc, project, regularItems, customerMaterials, контакт, менеджер, my, settings, signer);
+        const overlay = document.getElementById('loading-overlay');
+        if (overlay) overlay.remove();
+    } catch (err) {
+        console.error('Ошибка loadData:', err);
+        if (err.message === 'Документ не привязан к проекту') {
+            document.body.innerHTML = `<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Документ не привязан к проекту 🔗</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:linear-gradient(135deg,#f093fb 0%,#f5576c 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.container{background:#fff;border-radius:16px;padding:40px;max-width:500px;width:100%;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.2)}
+.icon{font-size:64px;margin-bottom:16px}
+h1{color:#e74c3c;font-size:24px;margin-bottom:8px}
+.subtitle{color:#7f8c8d;font-size:16px;margin-bottom:24px}
+.info-box{background:#fff5f5;border-left:4px solid #e74c3c;border-radius:8px;padding:16px;text-align:left;margin-bottom:16px}
+.info-box h3{color:#c0392b;font-size:16px;margin-bottom:8px}
+.info-box p{color:#2c3e50;font-size:14px;line-height:1.6}
+.info-box strong{color:#2c3e50}
+.btn{display:inline-block;background:#e74c3c;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-size:15px;margin-top:16px;transition:background .2s}
+.btn:hover{background:#c0392b}
+</style></head>
+<body><div class="container"><div class="icon">🔗</div><h1>Документ не привязан к проекту</h1><p class="subtitle">Невозможно сгенерировать PDF без привязки к проекту</p>
+<div class="info-box"><h3>🔍 Что произошло?</h3><p>Для формирования документа нужна привязка к проекту с реквизитами клиента.</p></div>
+<div class="info-box" style="background:#f8f9fa;border-left-color:#667eea;"><h3 style="color:#2c3e50;">💡 Что делать?</h3><p>Откройте карточку документа в NocoDB и выберите проект в поле <strong>"Проект"</strong>.</p></div>
+<a href="javascript:window.close();" class="btn">Закрыть вкладку</a></div></body></html>`;
+        } else {
+            document.body.innerHTML = `<h2>Ошибка загрузки данных</h2><p>${err.message}</p><p>Проверьте консоль браузера (F12) для деталей.</p>`;
+        }
+    }
+}
+
+function formatDate(dateStr) {
+    if (!dateStr) return '___________';
+    return new Date(dateStr).toLocaleDateString('ru-RU');
+}
+
+function generateDocNumber(dateStr, id) {
+    if (!dateStr) return id;
+    const d = new Date(dateStr);
+    return `${String(d.getFullYear()).slice(-2)}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}-${id}`;
+}
+
+const fmt = (n) => n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+
+function renderDocument(doc, project, regularItems, customerMaterials, контакт, менеджер, my, settings, signer) {
+    // 📄 ЗАГОЛОВОК И МЕТАДАННЫЕ
+    const docOverride = doc['Название документа'] || doc['Название_документа'] || '';
+    const settingsName = settings['Имя счета'] || settings['Имя_счета'] || '';
+    const finalTitle = docOverride || settingsName || 'Счет на оплату';
+    document.getElementById('docTitle').textContent = finalTitle;
+    
+    document.getElementById('docNumber').textContent = generateDocNumber(doc['Дата документа'], docId);
+    document.getElementById('docDate').textContent = formatDate(doc['Дата документа']);
+
+    const docPlace = doc['Место документа'] || doc['Место_документа'] || settings['Место'] || 'г. Минск';
+    document.getElementById('docPlace').textContent = docPlace;
+
+    const logoUrl = my['Логотип URL'] || my['Логотип_URL'];
+    if (logoUrl) {
+        const img = document.getElementById('companyLogo');
+        if (img) { img.src = logoUrl; img.style.display = 'block'; }
+    }
+
+    // 🆕 ПЕРИОД
+    if (doc['Период']) {
+        document.getElementById('periodText').textContent = doc['Период'];
+        document.getElementById('periodBlock').style.display = 'block';
+    }
+
+    // 👥 ДИНАМИЧЕСКИЕ НАЗВАНИЯ СТОРОН
+    const p1Name = settings['Название стороны 1'] || settings['Название_стороны_1'] || 'Исполнитель';
+    const p2Name = settings['Название стороны 2'] || settings['Название_стороны_2'] || 'Заказчик';
+    document.getElementById('party1Name').textContent = p1Name;
+    document.getElementById('party2Name').textContent = p2Name;
+    document.getElementById('signPartyName').textContent = p1Name;
+
+    // 📝 ШАПКА ДОКУМЕНТА (B2C-настройки)
+    const docHeader = doc['Шапка документа'] || doc['Шапка_документа'] || '';
+    const settingsHeader = settings['Шапка счета (Физлицо)'] || '';
+    const finalHeader = docHeader || settingsHeader || 'Счет на оплату услуг/товаров';
+    const introElement = document.getElementById('introText');
+    if (introElement) {
+        introElement.innerHTML = marked.parse(finalHeader);
+    }
+
+    // 🏢 РЕКВИЗИТЫ ИСПОЛНИТЕЛЯ
+    document.getElementById('myName').textContent = my['Имя'] || my['Название'] || '';
+    document.getElementById('myUNP').textContent = my['УНП'] || '';
+    document.getElementById('myAddress').textContent = my['Адрес'] || '';
+    document.getElementById('myPhone').textContent = my['Телефон'] || '';
+    document.getElementById('myEmail').textContent = my['E-mail'] || my['Email'] || '';
+    document.getElementById('myAccount').textContent = my['р/с'] || my['IBAN'] || '';
+    document.getElementById('myBank').textContent = my['Банк'] || '';
+    document.getElementById('myBIK').textContent = my['БИК'] || '';
+
+    // 👤 ДИНАМИЧЕСКИЕ РЕКВИЗИТЫ ЗАКАЗЧИКА (Только заполненные поля)
+    const cName = контакт['Имя'] || 'Физическое лицо';
+    document.getElementById('clientName').textContent = cName;
+    
+    const clientDetails = [];
+    if (контакт['Телефон']) clientDetails.push(`<b>Тел:</b> ${контакт['Телефон']}`);
+    if (контакт['E-mail']) clientDetails.push(`<b>Email:</b> ${контакт['E-mail']}`);
+    if (контакт['Адрес']) clientDetails.push(`<b>Адрес:</b> ${контакт['Адрес']}`);
+    if (контакт['Паспорт']) clientDetails.push(`<b>Паспорт:</b> ${контакт['Паспорт']}`);
+    
+    document.getElementById('clientDetailsBlock').innerHTML = clientDetails.join('<br>');
+
+    // 📊 ТАБЛИЦА ПОЗИЦИЙ И РАСЧЁТ (Только regularItems!)
+    const vatRate = parseFloat(my['Ставка НДС']) || 0;
+    const vatType = my['Тип НДС'] || 'Без НДС';
+    const tbody = document.getElementById('works');
+    let totalSum = 0, totalVAT = 0, totalWithVAT = 0;
+    
+    regularItems.forEach((work, idx) => {
+        const qty = parseFloat(work['Кол-во']) || 0;
+        const price = parseFloat(work['Цена']) || 0;
+        const sumWithoutVAT = qty * price;
+        
+        let displayName = work['Название'] || '';
+        if (!displayName) {
+            displayName = work['Название (ТН)'] || work['Название_(ТН)'] || 'Услуга/Товар';
+        }
+                
+        const unit = work['Ед. изм.'] || work['Ед._изм.'] || 'шт.';
+        
+        let vatAmount = 0, priceWithoutVat = price, sumWithVat = sumWithoutVAT;
+        
+        if (vatType === 'Включен в цену' && vatRate > 0) {
+            vatAmount = sumWithoutVAT * vatRate / (100 + vatRate);
+            priceWithoutVat = price - (vatAmount / (qty || 1));
+            sumWithVat = sumWithoutVAT;
+        } else if (vatType === 'Начисляется сверху' && vatRate > 0) {
+            vatAmount = sumWithoutVAT * vatRate / 100;
+            sumWithVat = sumWithoutVAT + vatAmount;
+        }
+        
+        totalSum += (priceWithoutVat * qty);
+        totalVAT += vatAmount;
+        totalWithVAT += sumWithVat;
+        
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td class="text-center">${idx + 1}</td>
+            <td>${displayName}</td>
+            <td class="text-center">${unit}</td>
+            <td class="text-center">${qty}</td>
+            <td class="text-right">${fmt(priceWithoutVat)}</td>
+            <td class="text-right">${fmt(priceWithoutVat * qty)}</td>
+            <td class="text-center">${vatType === 'Без НДС' ? 'Без НДС' : vatRate + '%'}</td>
+            <td class="text-right">${fmt(sumWithVat)}</td>
+        `;
+        tbody.appendChild(row);
+    });
+    
+    document.getElementById('totalSum').textContent = fmt(totalSum) + ' руб.';
+    document.getElementById('totalWithVAT').textContent = fmt(totalWithVAT) + ' руб.';
+    document.getElementById('sumWords').textContent = numberToWords(totalWithVAT);
+    
+    // 💰 БЛОК НДС
+    const vatNoteElement = document.getElementById('vatNote');
+    if (vatNoteElement) {
+        if (vatType === 'Без НДС') {
+            vatNoteElement.innerHTML = `НДС не облагается в связи с применением упрощенной системы налогообложения.`;
+            vatNoteElement.style.display = 'block';
+            vatNoteElement.style.fontStyle = 'italic';
+        } else if (vatRate > 0) {
+            const vatWords = numberToWords(totalVAT);
+            if (vatType === 'Включен в цену') {
+                vatNoteElement.innerHTML = `В том числе НДС (${vatRate}%) — ${vatWords}.`;
+            } else {
+                vatNoteElement.innerHTML = `НДС (${vatRate}%) — ${vatWords}.`;
+            }
+            vatNoteElement.style.display = 'block';
+            vatNoteElement.style.fontStyle = 'normal';
+        } else {
+            vatNoteElement.style.display = 'none';
+        }
+    }
+
+    // 🆕 МАТЕРИАЛЫ ЗАКАЗЧИКА
+    if (customerMaterials.length > 0) {
+        const matTbody = document.getElementById('customerMaterialsTable');
+        customerMaterials.forEach((mat, idx) => {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td class="text-center">${idx + 1}</td>
+                <td>${mat['Название'] || mat['Название (ТН)'] || 'Материал'}</td>
+                <td class="text-center">${mat['Ед. изм.'] || 'шт.'}</td>
+                <td class="text-center">${mat['Кол-во'] || 1}</td>
+                <td>${mat['Примечания'] || ''}</td>
+            `;
+            matTbody.appendChild(row);
+        });
+        document.getElementById('customerMaterialsBlock').style.display = 'block';
+
+        // Оговорка из настроек
+        const disclaimer = settings['О материалах заказчика'];
+        if (disclaimer) {
+            document.getElementById('materialsDisclaimer').textContent = disclaimer;
+            document.getElementById('materialsDisclaimer').style.display = 'block';
+        }
+    }
+
+    // 🆕 ПРИМЕЧАНИЯ К ДОКУМЕНТУ (с Markdown, без заголовка)
+    if (doc['Примечания'] && doc['Примечания'].trim()) {
+        document.getElementById('docNotesText').innerHTML = marked.parse(doc['Примечания']);
+        document.getElementById('docNotesBlock').style.display = 'block';
+    }
+
+    // 📝 ПОДВАЛ ДОКУМЕНТА (B2C-настройки)
+    const docFooter = doc['Подвал документа'] || doc['Подвал_документа'] || '';
+    const settingsFooter = settings['Подвал счета (Физлицо)'] || '';
+    const finalFooter = docFooter || settingsFooter || 'Оплата данного счета означает полное согласие с условиями публичной оферты.';
+    
+    const legalElement = document.getElementById('legalConditions');
+    if (legalElement) {
+        legalElement.innerHTML = marked.parse(finalFooter);
+    }
+
+    // 📞 УПРАВЛЕНИЕ ВИДИМОСТЬЮ БЛОКА КОНТАКТОВ
+    const showContacts = settings['Блок контактов - счет'] || settings['Блок_контактов_-_счет'] || false;
+    const contactsSection = document.getElementById('contactsSection');
+    if (contactsSection) {
+        contactsSection.style.display = showContacts ? 'block' : 'none';
+    }
+
+    // Для нас: Менеджер проекта → Мои реквизиты → прочерки
+    let executorPhone, executorName, executorEmail;
+    if (менеджер && менеджер['Id']) {
+        executorPhone = менеджер['Телефон'] || my['Телефон'];
+        executorName = менеджер['ФИО'] || менеджер['Обращение'] || my['Имя'] || 'Менеджер';
+        executorEmail = менеджер['E-mail'] || менеджер['Email'] || my['E-mail'];
+    } else {
+        executorPhone = my['Телефон'];
+        executorName = my['Имя'] || 'Менеджер';
+        executorEmail = my['E-mail'];
+    }
+    document.getElementById('executorContact').textContent = `${executorPhone} ${executorName}`;
+    document.getElementById('myEmailLegal').textContent = executorEmail || '';
+
+    // ✍️ ПОДПИСИ
+    let signTitle = 'Директор', signName = '___________';
+    if (signer && signer['Id']) {
+        signTitle = signer['Должность'] || 'Директор';
+        signName = signer['ФИО'] || signer['Обращение'] || '___________';
+    }
+    document.getElementById('signTitle').textContent = signTitle;
+    document.getElementById('signName').textContent = signName;
+    
+    const hasStamp = doc['С печатью'] === true || doc['С печатью'] === 1 || doc['С печатью'] === '1' || doc['С печатью'] === 'true';
+    document.getElementById('stampImg').style.display = hasStamp ? 'block' : 'none';
+}
+
+function numberToWords(num) {
+    const units = ['', 'один', 'два', 'три', 'четыре', 'пять', 'шесть', 'семь', 'восемь', 'девять'];
+    const unitsFem = ['', 'одна', 'две', 'три', 'четыре', 'пять', 'шесть', 'семь', 'восемь', 'девять'];
+    const teens = ['десять', 'одиннадцать', 'двенадцать', 'тринадцать', 'четырнадцать', 'пятнадцать', 'шестнадцать', 'семнадцать', 'восемнадцать', 'девятнадцать'];
+    const tens = ['', '', 'двадцать', 'тридцать', 'сорок', 'пятьдесят', 'шестьдесят', 'семьдесят', 'восемьдесят', 'девяносто'];
+    const hundreds = ['', 'сто', 'двести', 'триста', 'четыреста', 'пятьсот', 'шестьсот', 'семьсот', 'восемьсот', 'девятьсот'];
+    
+    function convertTriplet(n, feminine = false) {
+        let result = '';
+        const u = feminine ? unitsFem : units;
+        if (n >= 100) { result += hundreds[Math.floor(n / 100)] + ' '; n %= 100; }
+        if (n >= 20) { result += tens[Math.floor(n / 10)] + ' '; n %= 10; }
+        else if (n >= 10) { result += teens[n - 10] + ' '; return result.trim(); }
+        if (n > 0) { result += u[n] + ' '; }
+        return result.trim();
+    }
+    
+    const rubles = Math.floor(num);
+    const kopecks = Math.round((num - rubles) * 100);
+    let result = '';
+    
+    if (rubles === 0) { result = 'ноль'; }
+    else if (rubles < 1000) { result = convertTriplet(rubles, false); }
+    else if (rubles < 1000000) {
+        const thousands = Math.floor(rubles / 1000);
+        const rest = rubles % 1000;
+        result = convertTriplet(thousands, true) + ' ' + (thousands === 1 ? 'тысяча' : thousands < 5 ? 'тысячи' : 'тысяч');
+        if (rest > 0) result += ' ' + convertTriplet(rest, false);
+    } else {
+        const millions = Math.floor(rubles / 1000000);
+        const thousands = Math.floor((rubles % 1000000) / 1000);
+        const rest = rubles % 1000;
+        result = convertTriplet(millions, false) + ' ' + (millions === 1 ? 'миллион' : millions < 5 ? 'миллиона' : 'миллионов');
+        if (thousands > 0) result += ' ' + convertTriplet(thousands, true) + ' ' + (thousands === 1 ? 'тысяча' : thousands < 5 ? 'тысячи' : 'тысяч');
+        if (rest > 0) result += ' ' + convertTriplet(rest, false);
+    }
+    
+    const lastTwo = rubles % 100;
+    const lastOne = rubles % 10;
+    let rubWord = 'белорусских рублей';
+    if (lastTwo < 10 || lastTwo > 20) {
+        if (lastOne === 1) rubWord = 'белорусский рубль';
+        else if (lastOne >= 2 && lastOne <= 4) rubWord = 'белорусских рубля';
+    }
+    
+    let kopWord = 'копеек';
+    if (kopecks > 0) {
+        const kopLastTwo = kopecks % 100;
+        const kopLastOne = kopecks % 10;
+        if (kopLastTwo < 10 || kopLastTwo > 20) {
+            if (kopLastOne === 1) kopWord = 'копейка';
+            else if (kopLastOne >= 2 && kopLastOne <= 4) kopWord = 'копейки';
+        }
+    }
+    
+    const kopStr = kopecks.toString().padStart(2, '0');
+    return `${result.trim()} ${rubWord} ${kopStr} ${kopWord}`;
+}
+</script>
+</body>
+</html>

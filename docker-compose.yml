@@ -1,0 +1,65 @@
+services:
+  nocodb:
+    image: nocodb/nocodb:2026.08.0
+    container_name: nocodb
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    restart: unless-stopped
+    environment:
+      - NC_AUTH_JWT_SECRET=${JWT_SECRET:-default_jwt_secret_change_this}
+    volumes:
+      - /mnt/data/nocodb-data:/usr/app/data
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  bot:
+    build:
+      context: .
+      dockerfile: bot/Dockerfile
+    container_name: printed4u-bot
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - NOCO_URL=http://nocodb:8080
+    volumes:
+      - ./shared:/app/shared
+      - /mnt/data/projects:/mnt/data/projects
+      - ./templates:/app/templates
+      - /mnt/data/clients:/mnt/data/clients
+      - /mnt/data/noco-static:/mnt/data/noco-static
+      - /mnt/data/backups:/mnt/data/backups:ro # 💾 v4.12.0: статус бэкапов в /backup (bot.js)
+      - ${RCLONE_CONF:-/dev/null}:/home/node/.config/rclone/rclone.conf:ro # 💾 v4.34.0: облачные бэкапы в /backup (Проблемы 108+109; путь — из .env, переживает git pull; dest = home юзера node, контейнер идёт от user ${APP_UID} и /root ему недоступен)
+    ports:
+      - "3000:3000"
+    depends_on:
+      nocodb:
+        condition: service_healthy
+
+  webhook:
+    build:
+      context: .
+      dockerfile: webhook/Dockerfile
+    container_name: printed4u-webhook
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - NOCO_URL=http://nocodb:8080
+    volumes:
+      - ./shared:/app/shared
+      - /mnt/data/projects:/mnt/data/projects
+      - /mnt/data/clients:/mnt/data/clients
+      - ./templates:/app/templates
+      - /mnt/data/noco-static:/mnt/data/noco-static # 🆕 ДОБАВЛЕНО: чтобы вебхук видел сгенерированные PDF
+      - /mnt/data/nocodb-data:/mnt/data/nocodb-data # 🔒 v4.18.0: для /transfer-project (смена менеджера через junction-таблицу; rw — иначе sqlite не может писать в WAL)
+    ports:
+      - "3001:3001"
+    depends_on:
+      nocodb:
+        condition: service_healthy

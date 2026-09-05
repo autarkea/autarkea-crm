@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Товарная накладная</title>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+* { box-sizing: border-box; }
+body { font-family: 'Montserrat', Arial, sans-serif; font-size: 8pt; margin: 5mm; line-height: 1.1; color: #000; }
+.top-container { display: flex; justify-content: center; align-items: flex-end; width: 100%; margin-bottom: 0; }
+.unp-side-label { font-weight: 700; font-size: 8.5pt; margin-right: 10px; padding-bottom: 4px; }
+.top-table { border-collapse: collapse; font-size: 8.5pt; width: auto; }
+.top-table td { border: 1px solid #000; padding: 3px 15px; text-align: center; }
+.header-cell { font-weight: 700; background: #f5f5f5; }
+.spacer-compact { height: 5mm; }
+.date-line { text-align: center; font-size: 9pt; margin: 5px 0 8px 0; font-weight: 500; }
+.details-block { width: 100%; margin-bottom: 8px; }
+.detail-row { display: flex; align-items: flex-start; margin-bottom: 2px; }
+.detail-label { font-weight: 600; width: 140px; flex-shrink: 0; padding-top: 2px; text-align: left; }
+.detail-content { flex-grow: 1; display: flex; flex-direction: column; }
+.detail-value { border-bottom: 1px solid #000; padding: 1px 4px 2px 4px; min-height: 14px; font-weight: 500; text-align: left; }
+.detail-caption { font-size: 6.5pt; color: #444; margin-top: 2px; text-align: center; }
+.section-header { font-weight: 700; font-size: 9pt; text-align: center; margin: 6px 0 4px 0; text-transform: uppercase; }
+.goods-table { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 7.5pt; }
+.goods-table th, .goods-table td { border: 1px solid #000; padding: 2px 3px; vertical-align: middle; }
+.goods-table th { background: #f5f5f5; font-weight: 600; text-align: center; }
+.text-right { text-align: right; }
+.text-center { text-align: center; }
+.total-row { font-weight: 600; background: #fafafa; }
+.total-section { margin: 6px 0; font-size: 8pt; }
+.total-line { margin: 2px 0; }
+.vat-note { margin: 4px 0; font-size: 7.5pt; font-style: italic; color: #444; }
+
+/* 🆕 Стили для примечаний документа и Markdown */
+.doc-notes-block { margin-top: 10px; margin-bottom: 10px; font-size: 8pt; line-height: 1.4; }
+.doc-notes-block p { margin: 3px 0; }
+.doc-notes-block ul, .doc-notes-block ol { margin: 3px 0 3px 18px; padding: 0; }
+.doc-notes-block li { margin: 2px 0; }
+.doc-notes-block strong { font-weight: 700; }
+.doc-notes-block em { font-style: italic; }
+.doc-notes-block br { margin: 0; }
+
+.signatures-block { width: 100%; margin-top: 4px; page-break-inside: avoid; }
+.signature-full-row { display: flex; align-items: flex-start; margin-bottom: 4px; }
+.signature-label { font-weight: 600; min-width: 160px; padding-top: 2px; text-align: left; white-space: nowrap; }
+.signature-content { flex-grow: 1; display: flex; flex-direction: column; }
+.signature-line { min-height: 14px; padding: 1px 4px 2px 4px; font-weight: 500; }
+.signature-caption { font-size: 6.5pt; color: #444; margin-top: 2px; text-align: center; line-height: 1.2; }
+
+.poat-row { display: flex; align-items: flex-end; width: 100%; white-space: nowrap; gap: 15px; }
+.poat-col { display: flex; flex-direction: column; align-items: center; text-align: center; }
+.poat-col-1 { flex: 1; }
+.poat-col-2 { flex: 1.2; }
+.poat-col-3 { flex: 1; max-width: 220px; }
+.poat-line { border-bottom: 1px solid #000; display: inline-block; vertical-align: bottom; height: 18px; }
+.poat-line-sig { width: 100%; }
+.poat-line-num { width: 45px; margin: 0 4px; }
+.poat-line-date { width: 65px; margin: 0 4px; }
+.poat-line-org { width: 150px; margin-left: 4px; }
+.poat-text { font-size: 7.5pt; display: inline-flex; align-items: flex-end; }
+.poat-caption { font-size: 6.5pt; color: #444; margin-top: 2px; text-align: center; line-height: 1.2; white-space: normal; }
+
+@media print {
+    body { margin: 5mm; }
+    @page { size: A4; margin: 5mm; }
+    .spacer-compact { height: 3mm !important; }
+    .signature-label { min-width: 140px !important; }
+    .poat-row { gap: 10px !important; }
+    .poat-line-org { width: 130px !important; }
+    .poat-line-num { width: 40px !important; }
+    .poat-line-date { width: 60px !important; }
+    a { text-decoration: none; color: #000; }
+}
+</style>
+</head>
+<body>
+
+<!-- 🛡️ Overlay: показывается до завершения проверки -->
+<div id="loading-overlay" style="position:fixed;inset:0;background:#fff;z-index:9999;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;">
+    <div style="width:40px;height:40px;border:4px solid #e0e0e0;border-top-color:#e74c3c;border-radius:50%;animation:spin .8s linear infinite;"></div>
+    <span style="color:#7f8c8d;font-family:'Segoe UI',sans-serif;font-size:14px;">Загрузка документа...</span>
+</div>
+<style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+
+<div class="top-container">
+    <div class="unp-side-label">УНП</div>
+    <table class="top-table">
+        <tr>
+            <td class="header-cell">Грузоотправитель</td>
+            <td class="header-cell">Грузополучатель</td>
+        </tr>
+        <tr>
+            <td id="shipperUNP_top"></td>
+            <td id="consigneeUNP_top"></td>
+        </tr>
+    </table>
+</div>
+
+<div style="height: 35mm;"></div>
+
+<div class="date-line">
+    «<span id="tnDay">__</span>» <span id="tnMonth">________</span> 20<span id="tnYear">__</span> г.
+</div>
+
+<div class="details-block">
+    <div class="detail-row">
+        <div class="detail-label">Грузоотправитель</div>
+        <div class="detail-content">
+            <span class="detail-value" id="shipperLine"></span>
+            <span class="detail-caption">(наименование, адрес)</span>
+        </div>
+    </div>
+
+    <div class="detail-row">
+        <div class="detail-label">Грузополучатель</div>
+        <div class="detail-content">
+            <span class="detail-value" id="consigneeLine"></span>
+            <span class="detail-caption">(наименование, адрес)</span>
+        </div>
+    </div>
+
+    <div class="detail-row">
+        <div class="detail-label">Основание отпуска</div>
+        <div class="detail-content">
+            <span class="detail-value" id="basisLine"></span>
+            <span class="detail-caption">(наименование, дата и номер документа)</span>
+        </div>
+    </div>
+</div>
+
+<div class="section-header">I. ТОВАРНЫЙ РАЗДЕЛ</div>
+
+<table class="goods-table">
+    <thead>
+        <tr>
+            <th style="width:4%">№<br>п/п</th>
+            <th style="width:30%">Наименование товара</th>
+            <th style="width:8%">Единица<br>измерения</th>
+            <th style="width:8%">Коли-<br>чество</th>
+            <th style="width:11%">Цена,<br>руб. коп.</th>
+            <th style="width:11%">Стоимость,<br>руб. коп.</th>
+            <th style="width:8%">Ставка<br>НДС, %</th>
+            <th style="width:8%">Сумма<br>НДС,<br>руб. коп.</th>
+            <th style="width:11%">Стоимость<br>с НДС,<br>руб. коп.</th>
+            <th style="width:7%">Приме-<br>чание</th>
+        </tr>
+    </thead>
+    <tbody id="items"></tbody>
+    <tfoot>
+        <tr class="total-row">
+            <td colspan="3" style="text-align: right; font-weight: 600;">ИТОГО:</td>
+            <td class="text-center" id="totalQty"></td>
+            <td class="text-right" id="totalPrice"></td>
+            <td class="text-right" id="totalSum"></td>
+            <td style="text-align: center;">x</td>
+            <td class="text-right" id="totalVAT"></td>
+            <td class="text-right" id="totalWithVAT"></td>
+            <td>x</td>
+        </tr>
+    </tfoot>
+</table>
+
+<div class="vat-note" id="vatNote" style="display: none;"></div>
+
+<div class="total-section">
+    <div class="total-line">
+        <b>Всего сумма НДС:</b> 
+        <span id="vatWords"></span> 
+    </div>
+    <div class="total-line">
+        <b>Всего стоимость с НДС:</b> 
+        <span id="sumWords"></span>
+    </div>
+</div>
+
+<!-- 🆕 ПРИМЕЧАНИЯ К ДОКУМЕНТУ (с Markdown, без заголовка) -->
+<div id="docNotesBlock" class="doc-notes-block" style="display: none;">
+    <div id="docNotesText"></div>
+</div>
+
+<div class="signatures-block">
+    
+    <div class="signature-full-row">
+        <div class="signature-label">Отпуск разрешил</div>
+        <div class="signature-content">
+            <div class="signature-line" style="display: flex; align-items: flex-end; border-bottom: 1px solid #000; padding: 1px 4px 2px 4px;">
+                <span id="signerTitle"></span>
+                <span style="width: 4cm; flex-shrink: 0;"></span>
+                <span id="signerName"></span>
+            </div>
+            <span class="signature-caption">(должность, ФИО, подпись)</span>
+        </div>
+    </div>
+    
+    <div class="signature-full-row">
+        <div class="signature-label">Сдал грузоотправитель</div>
+        <div class="signature-content">
+            <div class="signature-line" style="display: flex; align-items: flex-end; border-bottom: 1px solid #000; padding: 1px 4px 2px 4px;">
+                <span id="storekeeperTitle"></span>
+                <span style="width: 4cm; flex-shrink: 0;"></span>
+                <span id="storekeeperName"></span>
+            </div>
+            <span class="signature-caption">(должность, ФИО, подпись)</span>
+        </div>
+    </div>
+    
+    <div class="signature-full-row">
+        <div class="signature-label">Товар к доставке принял</div>
+        <div class="signature-content">
+            <div class="poat-row">
+                <div class="poat-col poat-col-1">
+                    <div class="poat-line poat-line-sig"></div>
+                    <div class="poat-caption">(должность, ФИО, подпись)</div>
+                </div>
+                <div class="poat-col poat-col-2">
+                    <div class="poat-text">
+                        по доверенности №<span class="poat-line poat-line-num"></span>от<span class="poat-line poat-line-date"></span>
+                    </div>
+                    <div class="poat-caption">(номер, дата)</div>
+                </div>
+                <div class="poat-col poat-col-3">
+                    <div class="poat-text">
+                        выданной<span class="poat-line poat-line-org"></span>
+                    </div>
+                    <div class="poat-caption">(наименование организации)</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="signature-full-row">
+        <div class="signature-label">Принял грузополучатель</div>
+        <div class="signature-content">
+            <div class="signature-line" style="border-bottom: 1px solid #000; min-height: 14px;" id="receiverLine"></div>
+            <span class="signature-caption">(должность, ФИО, подпись)</span>
+        </div>
+    </div>
+    
+</div>
+
+<div style="margin-top: 12px; font-size: 8pt; display: flex; align-items: baseline;">
+    <div style="font-weight: 600; min-width: 200px;">С товаром переданы документы:</div>
+    <div style="flex-grow: 1; padding: 1px 5px;" id="docsLine"></div>
+</div>
+
+<script>
+(function() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const SECRET = urlParams.get('secret');
+    if (!SECRET) {
+        document.body.innerHTML = `
+    <style>
+        html, body { margin: 0 !important; padding: 0 !important; height: 100% !important; width: 100% !important; }
+    </style>
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 9999;">
+        <div style="background: white; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); padding: 40px; max-width: 600px; width: 100%; text-align: center;">
+            <div style="font-size: 80px; margin-bottom: 20px;">🔒</div>
+            <h1 style="color: #c0392b; font-size: 32px; margin-bottom: 10px; font-weight: 700;">Доступ запрещён</h1>
+            <p style="color: #7f8c8d; font-size: 16px; margin-bottom: 30px;">Отсутствует секретный ключ в URL</p>
+            <div style="background: #f8f9fa; border-left: 4px solid #667eea; padding: 20px; border-radius: 8px; margin: 20px 0; text-align: left;">
+                <h3 style="color: #2c3e50; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 15px; font-weight: 600;">💡 Что делать?</h3>
+                <p style="color: #2c3e50; font-size: 15px; line-height: 1.6;">Откройте документ через <strong>формулу-кнопку в NocoDB</strong>.</p>
+            </div>
+            <a href="javascript:window.close();" style="display: inline-block; background: #e74c3c; color: white; text-decoration: none; padding: 12px 30px; border-radius: 10px; font-size: 16px; font-weight: 600; margin-top: 20px;">Закрыть вкладку</a>
+        </div>
+    </div>
+`;
+        throw new Error('Missing secret parameter');
+    }
+    const originalFetch = window.fetch;
+    window.fetch = function(url, options = {}) {
+        if (typeof url === 'string' && url.startsWith('/api/')) {
+            const separator = url.includes('?') ? '&' : '?';
+            url = url + separator + 'secret=' + encodeURIComponent(SECRET);
+        }
+        return originalFetch(url, options);
+    };
+})();
+
+const params = new URLSearchParams(window.location.search);
+const docId = params.get('doc');
+
+if (!docId || docId === 'ID' || isNaN(parseInt(docId))) {
+    document.body.innerHTML = '<h2>Ошибка: некорректный ID документа</h2>';
+} else {
+    loadData();
+}
+
+async function loadData() {
+    try {
+        const docRes = await fetch(`/api/doc/${docId}`);
+        if (!docRes.ok) throw new Error('Ошибка загрузки данных');
+        const docData = await docRes.json();
+        const doc = docData.list ? docData.list[0] : docData;
+
+        // 🛡️ Ранняя проверка: привязан ли документ к проекту
+        let projectId = null;
+        const projectField = doc['Проект'];
+        if (projectField) {
+            if (Array.isArray(projectField)) projectId = projectField[0]?.Id || projectField[0];
+            else if (typeof projectField === 'object') projectId = projectField.Id;
+            else projectId = projectField;
+        }
+        if (!projectId) throw new Error('Документ не привязан к проекту');
+
+        const [myRes, settingsRes] = await Promise.all([
+            fetch('/api/my-details'),
+            fetch('/api/doc-settings')
+        ]);
+
+        if (!myRes.ok) throw new Error('Ошибка загрузки данных');
+
+        const myData = await myRes.json();
+        const my = myData.list ? myData.list[0] : myData;
+
+        const settingsData = await settingsRes.json();
+        const settings = settingsData.list ? settingsData.list[0] : settingsData;
+
+        const projectRes = await fetch(`/api/project/${projectId}`);
+        const projectData = projectRes.ok ? await projectRes.json() : {};
+        const project = projectData.list ? projectData.list[0] : projectData;
+
+        let clientId = null, contactId = null;
+        const юрлицоField = project['Юрлицо'];
+        if (юрлицоField) clientId = Array.isArray(юрлицоField) ? юрлицоField[0]?.Id : (typeof юрлицоField === 'object' ? юрлицоField.Id : юрлицоField);
+        
+        const контактField = project['Контакт'];
+        if (контактField) contactId = Array.isArray(контактField) ? контактField[0]?.Id : (typeof контактField === 'object' ? контактField.Id : контактField);
+
+        let signerId = null, storekeeperId = null;
+        
+        const signerField = doc['Подписант документа'] || settings['Подписант'];
+        if (signerField) {
+            signerId = Array.isArray(signerField) ? signerField[0]?.Id : (typeof signerField === 'object' ? signerField.Id : signerField);
+        }
+        
+        const storekeeperField = doc['Кладовщик документа'] || settings['Кладовщик'];
+        if (storekeeperField) {
+            storekeeperId = Array.isArray(storekeeperField) ? storekeeperField[0]?.Id : (typeof storekeeperField === 'object' ? storekeeperField.Id : storekeeperField);
+        }
+
+        let юрлицо = {}, контакт = {}, signer = {}, storekeeper = {};
+        
+        if (clientId) { 
+            const r = await fetch(`/api/client/${clientId}`); 
+            if (r.ok) { const d = await r.json(); юрлицо = d.list ? d.list[0] : d; } 
+        }
+        if (contactId) { 
+            const r = await fetch(`/api/contact/${contactId}`); 
+            if (r.ok) { const d = await r.json(); контакт = d.list ? d.list[0] : d; } 
+        }
+        if (signerId) { 
+            const r = await fetch(`/api/employee/${signerId}`); 
+            if (r.ok) { const d = await r.json(); signer = d.list ? d.list[0] : d; } 
+        }
+        if (storekeeperId) { 
+            const r = await fetch(`/api/employee/${storekeeperId}`); 
+            if (r.ok) { const d = await r.json(); storekeeper = d.list ? d.list[0] : d; } 
+        }
+
+        const itemsRes = await fetch('/api/items');
+        const itemsData = itemsRes.ok ? await itemsRes.json() : {};
+        const allItems = itemsData.list || [];
+        
+        const tnItems = allItems.filter(w => {
+            const isLinked = w['Проекты'] && (w['Проекты'].Id == projectId || (Array.isArray(w['Проекты']) && w['Проекты'].some(p => p.Id == projectId)));
+            const isGoods = w['Тип'] === 'Товар' || w['Тип'] === 'Товар+Работа';
+            return isLinked && isGoods;
+        });
+
+        let invoiceDoc = null;
+        const docsRes = await fetch('/api/docs');
+        if (docsRes.ok) {
+            const docsData = await docsRes.json();
+            const allDocs = docsData.list || [];
+            invoiceDoc = allDocs
+                .filter(d => {
+                    let pId = null;
+                    const pf = d['Проект'];
+                    if (pf) {
+                        if (Array.isArray(pf)) pId = pf[0]?.Id || pf[0];
+                        else if (typeof pf === 'object') pId = pf.Id;
+                        else pId = pf;
+                    }
+                    return pId == projectId && d['Тип документа'] === 'Счет';
+                })
+                .sort((a, b) => b.Id - a.Id)[0];
+        }
+
+        renderDocument(doc, project, tnItems, юрлицо, контакт, my, settings, invoiceDoc, signer, storekeeper);
+        const overlay = document.getElementById('loading-overlay');
+        if (overlay) overlay.remove();
+    } catch (err) {
+        console.error('Ошибка loadData:', err);
+        if (err.message === 'Документ не привязан к проекту') {
+            document.body.innerHTML = `<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Документ не привязан к проекту 🔗</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:linear-gradient(135deg,#f093fb 0%,#f5576c 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.container{background:#fff;border-radius:16px;padding:40px;max-width:500px;width:100%;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.2)}
+.icon{font-size:64px;margin-bottom:16px}
+h1{color:#e74c3c;font-size:24px;margin-bottom:8px}
+.subtitle{color:#7f8c8d;font-size:16px;margin-bottom:24px}
+.info-box{background:#fff5f5;border-left:4px solid #e74c3c;border-radius:8px;padding:16px;text-align:left;margin-bottom:16px}
+.info-box h3{color:#c0392b;font-size:16px;margin-bottom:8px}
+.info-box p{color:#2c3e50;font-size:14px;line-height:1.6}
+.info-box strong{color:#2c3e50}
+.btn{display:inline-block;background:#e74c3c;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-size:15px;margin-top:16px;transition:background .2s}
+.btn:hover{background:#c0392b}
+</style></head>
+<body><div class="container"><div class="icon">🔗</div><h1>Документ не привязан к проекту</h1><p class="subtitle">Невозможно сгенерировать PDF без привязки к проекту</p>
+<div class="info-box"><h3>🔍 Что произошло?</h3><p>Для формирования документа нужна привязка к проекту с реквизитами клиента.</p></div>
+<div class="info-box" style="background:#f8f9fa;border-left-color:#667eea;"><h3 style="color:#2c3e50;">💡 Что делать?</h3><p>Откройте карточку документа в NocoDB и выберите проект в поле <strong>"Проект"</strong>.</p></div>
+<a href="javascript:window.close();" class="btn">Закрыть вкладку</a></div></body></html>`;
+        } else {
+            document.body.innerHTML = `<h2>Ошибка загрузки данных</h2><p>${err.message}</p><p>Проверьте консоль браузера (F12) для деталей.</p>`;
+        }
+    }
+}
+
+function formatDateTN(dateStr) {
+    if (!dateStr) return { day: '__', month: '________', year: '__' };
+    const d = new Date(dateStr);
+    const months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+    return {
+        day: String(d.getDate()).padStart(2, '0'),
+        month: months[d.getMonth()],
+        year: String(d.getFullYear()).slice(-2)
+    };
+}
+
+function formatDateSimple(dateStr) {
+    if (!dateStr) return '___________';
+    const d = new Date(dateStr);
+    return d.toLocaleDateString('ru-RU');
+}
+
+function generateDocNumber(dateStr, id) {
+    if (!dateStr) return id;
+    const d = new Date(dateStr);
+    const day = String(d.getDate()).padStart(2, '0');
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const year = String(d.getFullYear()).slice(-2);
+    return `${year}${month}${day}-${id}`;
+}
+
+const fmt = (n) => n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+
+// 🆕 УМНАЯ ЛОГИКА ОСНОВАНИЯ (v3 — с "Основание дополнительно", универсальная)
+function getBasisText(doc, project, client, invoiceDoc, settings, isB2C = false) {
+    let contractBasis = null;
+    let isGenericContract = false;
+
+    // 🔴 Уровень 1: Шапка документа (абсолютный приоритет для накладной)
+    if (doc['Шапка документа'] || doc['Шапка_документа']) {
+        return doc['Шапка документа'] || doc['Шапка_документа'];
+    }
+
+    // ШАГ 1: Определяем базовое основание (договор/оферта)
+    if (project['Договор основания']) {
+        contractBasis = project['Договор основания'];
+    } else if (client && client['Договор основания']) {
+        contractBasis = client['Договор основания'];
+    } else if (isB2C && (settings['Основание по умолчанию (Физлицо)'] || settings['Основание по умолчанию'])) {
+        contractBasis = settings['Основание по умолчанию (Физлицо)'] || settings['Основание по умолчанию'];
+        isGenericContract = true;
+    } else if (!isB2C && settings['Основание по умолчанию']) {
+        contractBasis = settings['Основание по умолчанию'];
+        isGenericContract = true;
+    }
+
+    // ШАГ 2: Определяем счёт (если есть)
+    let invoiceBasis = null;
+    if (invoiceDoc) {
+        const invNum = generateDocNumber(invoiceDoc['Дата документа'], invoiceDoc.Id);
+        const invDate = formatDateSimple(invoiceDoc['Дата документа']);
+        invoiceBasis = `Счет № ${invNum} от ${invDate}`;
+    }
+
+    // ШАГ 3: Формируем итоговую строку (основной каскад)
+    let result = '';
+    if (contractBasis && !isGenericContract) {
+        result = contractBasis;
+    } else if (contractBasis && isGenericContract && invoiceBasis) {
+        result = `${contractBasis}, ${invoiceBasis}`;
+    } else if (contractBasis && isGenericContract) {
+        result = contractBasis;
+    } else if (invoiceBasis) {
+        result = invoiceBasis;
+    } else {
+        result = 'Договор-оферта';
+    }
+
+    // 🆕 ШАГ 4: ОСНОВАНИЕ ДОПОЛНИТЕЛЬНО (каскад: Документ → Настройки)
+    const additionalBasis = doc['Основание дополнительно'] || settings['Основание дополнительно'];
+    if (additionalBasis && additionalBasis.trim()) {
+        result = `${result}, ${additionalBasis.trim()}`;
+    }
+
+    return result;
+}
+
+function renderDocument(doc, project, items, юрлицо, контакт, my, settings, invoiceDoc, signer, storekeeper) {
+    const tnDate = formatDateTN(doc['Дата документа']);
+    document.getElementById('tnDay').textContent = tnDate.day;
+    document.getElementById('tnMonth').textContent = tnDate.month;
+    document.getElementById('tnYear').textContent = tnDate.year;
+
+    document.getElementById('shipperUNP_top').textContent = my['УНП'] || '';
+    document.getElementById('consigneeUNP_top').textContent = юрлицо['УНП'] || контакт['УНП'] || '';
+
+    const deliveryAddress = юрлицо['Адрес доставки'] || юрлицо['Адрес'] || контакт['Адрес'] || '';
+    const shipperAddress = my['Адрес отгрузки'] || my['Адрес'] || '';
+    document.getElementById('shipperLine').textContent = `${my['Имя'] || my['Название'] || ''}, ${shipperAddress}`;
+    document.getElementById('consigneeLine').textContent = `${юрлицо['Имя'] || юрлицо['Название'] || контакт['Имя'] || ''}, ${deliveryAddress}`;
+    
+    // 🆕 УМНАЯ ЛОГИКА ОСНОВАНИЯ (v3, B2B = false)
+    const basisText = getBasisText(doc, project, юрлицо, invoiceDoc, settings, false);
+    document.getElementById('basisLine').textContent = basisText;
+
+    let signerTitle, signerName;
+    if (signer && signer['Id']) {
+        signerTitle = signer['Должность'] || 'Директор';
+        signerName = signer['ФИО'] || signer['Обращение'] || '___________';
+    } else {
+        signerTitle = 'Директор';
+        signerName = '___________';
+    }
+    document.getElementById('signerTitle').textContent = signerTitle;
+    document.getElementById('signerName').textContent = signerName;
+
+    let storekeeperTitle, storekeeperName;
+    if (storekeeper && storekeeper['Id']) {
+        storekeeperTitle = storekeeper['Должность'] || 'Кладовщик';
+        storekeeperName = storekeeper['ФИО'] || storekeeper['Обращение'] || '___________';
+    } else {
+        storekeeperTitle = 'Кладовщик';
+        storekeeperName = '___________';
+    }
+    document.getElementById('storekeeperTitle').textContent = storekeeperTitle;
+    document.getElementById('storekeeperName').textContent = storekeeperName;
+
+    const tnNumber = doc['Номер ТН'] || '';
+    document.getElementById('docsLine').textContent = tnNumber ? `Товарная накладная ${tnNumber}` : 'Товарная накладная';
+
+    const vatRate = parseFloat(my['Ставка НДС']) || 0;
+    const vatType = my['Тип НДС'] || 'Без НДС';
+    const tbody = document.getElementById('items');
+    let totalQty = 0, totalSum = 0, totalVAT = 0, totalWithVAT = 0;
+    
+    items.forEach((item, idx) => {
+        const qty = parseFloat(item['Кол-во']) || 0;
+        const price = parseFloat(item['Цена']) || 0;
+        const sumWithoutVAT = qty * price;
+        
+        let displayName = item['Название (ТН)'] || item['Название'] || 'Товар';
+        const unit = item['Ед. изм.'] || item['Ед._изм.'] || 'шт.';
+        
+        let vatAmount = 0, priceWithoutVat = price, sumWithVat = sumWithoutVAT;
+        
+        if (vatType === 'Включен в цену' && vatRate > 0) {
+            vatAmount = sumWithoutVAT * vatRate / (100 + vatRate);
+            priceWithoutVat = price - (vatAmount / (qty || 1));
+            sumWithVat = sumWithoutVAT;
+        } else if (vatType === 'Начисляется сверху' && vatRate > 0) {
+            vatAmount = sumWithoutVAT * vatRate / 100;
+            sumWithVat = sumWithoutVAT + vatAmount;
+        }
+        
+        totalQty += qty;
+        totalSum += (priceWithoutVat * qty);
+        totalVAT += vatAmount;
+        totalWithVAT += sumWithVat;
+        
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td class="text-center">${idx + 1}</td>
+            <td>${displayName}</td>
+            <td class="text-center">${unit}</td>
+            <td class="text-center">${qty}</td>
+            <td class="text-right">${fmt(priceWithoutVat)}</td>
+            <td class="text-right">${fmt(priceWithoutVat * qty)}</td>
+            <td class="text-center">${vatType === 'Без НДС' ? '-' : vatRate + '%'}</td>
+            <td class="text-right">${fmt(vatAmount)}</td>
+            <td class="text-right">${fmt(sumWithVat)}</td>
+            <td>${item['Примечания'] || ''}</td>
+        `;
+        tbody.appendChild(row);
+    });
+    
+    document.getElementById('totalQty').textContent = totalQty;
+    document.getElementById('totalPrice').textContent = '-';
+    document.getElementById('totalSum').textContent = fmt(totalSum);
+    document.getElementById('totalVAT').textContent = fmt(totalVAT);
+    document.getElementById('totalWithVAT').textContent = fmt(totalWithVAT);
+    
+    const vatNoteElement = document.getElementById('vatNote');
+    if (vatNoteElement) {
+        if (vatType === 'Без НДС') {
+            vatNoteElement.innerHTML = `НДС не исчисляется, так как грузоотправитель применяет упрощенную систему налогообложения в соответствии с главой 34 Налогового кодекса Республики Беларусь.`;
+            vatNoteElement.style.display = 'block';
+        } else if (vatRate > 0) {
+            const vatWords = numberToWords(totalVAT);
+            if (vatType === 'Включен в цену') {
+                vatNoteElement.innerHTML = `В том числе НДС (${vatRate}%) — ${vatWords}.`;
+            } else if (vatType === 'Начисляется сверху') {
+                vatNoteElement.innerHTML = `НДС (${vatRate}%) — ${vatWords}.`;
+            }
+            vatNoteElement.style.display = 'block';
+        } else {
+            vatNoteElement.style.display = 'none';
+        }
+    }
+    
+    document.getElementById('vatWords').textContent = numberToWords(totalVAT);
+    document.getElementById('sumWords').textContent = numberToWords(totalWithVAT);
+
+    // 🆕 ПРИМЕЧАНИЯ К ДОКУМЕНТУ (с Markdown, без заголовка)
+    if (doc['Примечания'] && doc['Примечания'].trim()) {
+        document.getElementById('docNotesText').innerHTML = marked.parse(doc['Примечания']);
+        document.getElementById('docNotesBlock').style.display = 'block';
+    }
+}
+
+function numberToWords(num) {
+    const units = ['', 'один', 'два', 'три', 'четыре', 'пять', 'шесть', 'семь', 'восемь', 'девять'];
+    const unitsFem = ['', 'одна', 'две', 'три', 'четыре', 'пять', 'шесть', 'семь', 'восемь', 'девять'];
+    const teens = ['десять', 'одиннадцать', 'двенадцать', 'тринадцать', 'четырнадцать', 'пятнадцать', 'шестнадцать', 'семнадцать', 'восемнадцать', 'девятнадцать'];
+    const tens = ['', '', 'двадцать', 'тридцать', 'сорок', 'пятьдесят', 'шестьдесят', 'семьдесят', 'восемьдесят', 'девяносто'];
+    const hundreds = ['', 'сто', 'двести', 'триста', 'четыреста', 'пятьсот', 'шестьсот', 'семьсот', 'восемьсот', 'девятьсот'];
+    
+    function convertTriplet(n, feminine = false) {
+        let result = '';
+        const u = feminine ? unitsFem : units;
+        if (n >= 100) { result += hundreds[Math.floor(n / 100)] + ' '; n %= 100; }
+        if (n >= 20) { result += tens[Math.floor(n / 10)] + ' '; n %= 10; }
+        else if (n >= 10) { result += teens[n - 10] + ' '; return result.trim(); }
+        if (n > 0) { result += u[n] + ' '; }
+        return result.trim();
+    }
+    
+    const rubles = Math.floor(num);
+    const kopecks = Math.round((num - rubles) * 100);
+    let result = '';
+    
+    if (rubles === 0) { result = 'ноль'; }
+    else if (rubles < 1000) { result = convertTriplet(rubles, false); }
+    else if (rubles < 1000000) {
+        const thousands = Math.floor(rubles / 1000);
+        const rest = rubles % 1000;
+        result = convertTriplet(thousands, true) + ' ' + (thousands === 1 ? 'тысяча' : thousands < 5 ? 'тысячи' : 'тысяч');
+        if (rest > 0) result += ' ' + convertTriplet(rest, false);
+    } else {
+        const millions = Math.floor(rubles / 1000000);
+        const thousands = Math.floor((rubles % 1000000) / 1000);
+        const rest = rubles % 1000;
+        result = convertTriplet(millions, false) + ' ' + (millions === 1 ? 'миллион' : millions < 5 ? 'миллиона' : 'миллионов');
+        if (thousands > 0) result += ' ' + convertTriplet(thousands, true) + ' ' + (thousands === 1 ? 'тысяча' : thousands < 5 ? 'тысячи' : 'тысяч');
+        if (rest > 0) result += ' ' + convertTriplet(rest, false);
+    }
+    
+    const lastTwo = rubles % 100;
+    const lastOne = rubles % 10;
+    let rubWord = 'белорусских рублей';
+    if (lastTwo < 10 || lastTwo > 20) {
+        if (lastOne === 1) rubWord = 'белорусский рубль';
+        else if (lastOne >= 2 && lastOne <= 4) rubWord = 'белорусских рубля';
+    }
+    
+    let kopWord = 'копеек';
+    if (kopecks > 0) {
+        const kopLastTwo = kopecks % 100;
+        const kopLastOne = kopecks % 10;
+        if (kopLastTwo < 10 || kopLastTwo > 20) {
+            if (kopLastOne === 1) kopWord = 'копейка';
+            else if (kopLastOne >= 2 && kopLastOne <= 4) kopWord = 'копейки';
+        }
+    }
+    
+    const kopStr = kopecks.toString().padStart(2, '0');
+    return `${result.trim()} ${rubWord} ${kopStr} ${kopWord}`;
+}
+</script>
+</body>
+</html>
