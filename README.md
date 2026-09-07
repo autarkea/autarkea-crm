@@ -4,6 +4,10 @@
 
 # АЎТАРКЕЯ — CRM, которая не даёт терять счета и заказы
 
+[![version](https://img.shields.io/github/v/tag/autarkea/autarkea-crm?label=version&color=2b7489)](https://github.com/autarkea/autarkea-crm/releases)
+[![last commit](https://img.shields.io/github/last-commit/autarkea/autarkea-crm?color=2b7489)](https://github.com/autarkea/autarkea-crm/commits/main)
+[![license: MIT](https://img.shields.io/github/license/autarkea/autarkea-crm?color=2b7489)](LICENSE)
+
 **Твой бизнес живёт в Telegram? Значит, и CRM ему нужна такая.**
 
 Коробочная CRM для бизнеса, который работает заказами и проектами (1–15 человек):
