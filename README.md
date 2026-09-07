@@ -196,6 +196,10 @@ bash upgrade.sh             # бэкап → миграции → обновле
 
 ---
 
+📦 Свежие релизы и история версий: [Releases](https://github.com/autarkea/autarkea-crm/releases)
+
+---
+
 **Александр · @autarkea (Telegram) · [GitHub](https://github.com/autarkea) · autarkea.by**
 
 *Отвечаю лично. Потому что сам этим пользуюсь.*
