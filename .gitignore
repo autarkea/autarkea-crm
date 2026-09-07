@@ -1,0 +1,33 @@
+# Секреты
+.env
+.env.local
+.env.*.local
+
+# Зависимости
+node_modules/
+package-lock.json
+
+# Логи
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Данные
+data/
+backups/
+/mnt/data/
+
+# ОС
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Временные файлы
+*.tmp
+*.bak
