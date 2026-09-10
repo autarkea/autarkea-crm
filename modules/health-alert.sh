@@ -16,8 +16,22 @@ set -u
 
 LOG_FILE="/mnt/data/logs/health-alert.log"
 FLAG_DIR="/mnt/data/logs"
+DB_FILE="${DB_FILE:-/mnt/data/nocodb-data/noco.db}"
+# v4.51.0 (по итогам смоука R2 на VM): адресат алертов кэшируется на диск.
+# Проблема: при падении NocoDB (битая база) get_admin_chat_id() не работает,
+# а fallback TELEGRAM_USER_ID устарел (доступ — через таблицу «Сотрудники»),
+# → алерт «немел» ровно в момент аварии. Кэш переживает падение NocoDB.
+ADMIN_CHAT_FILE="$FLAG_DIR/admin-chat-id"
+# v4.50.0: контроль целостности БД не чаще раза в сутки (кроме --boot) —
+# полный PRAGMA integrity_check на живой базе стоит ресурсов при большом объёме.
+INTEGRITY_TICK_FILE="$FLAG_DIR/last-db-integrity"
+INTEGRITY_INTERVAL_SEC=86400
 INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CRON_JOB="*/5 * * * * bash $INSTALL_DIR/modules/health-alert.sh >> $LOG_FILE 2>&1"
+# v4.51.1: stdout в /dev/null — log()/tee сами пишут в $LOG_FILE, а редирект
+# cron в тот же файл дублировал каждую запись лога (найдено прогоном R5–R8).
+CRON_JOB="*/5 * * * * bash $INSTALL_DIR/modules/health-alert.sh >/dev/null 2>&1"
+# v4.50.0: boot-отчёт после перезагрузки сервера (свет дали — владелец узнает сам)
+CRON_BOOT_JOB="@reboot sleep 60 && bash $INSTALL_DIR/modules/health-alert.sh --boot >/dev/null 2>&1"
 
 # Загружаем переменные из .env.
 # ⚠️ v4.28.5: НЕ используем `source .env` — он ломается на значениях с пробелами
@@ -88,17 +102,39 @@ PY
 
 # ────────────────────────────────────────────────────────────────────────────
 # Telegram_ID получателя алертов: Руководитель из NocoDB, а если NocoDB лежит
-# (упал весь стек — перезагрузка, диск, docker down) — fallback на
-# TELEGRAM_USER_ID из .env (v4.46.0, Проблема 117: раньше алерт «немел» ровно
-# в момент полного падения, т.к. адресат определялся только через NocoDB).
+# (упал весь стек — перезагрузка, диск, docker down) — кэш на диске
+# (v4.51.0, записан при последней живой работе) и fallback на TELEGRAM_USER_ID
+# из .env (v4.46.0, Проблема 117: раньше алерт «немел» ровно в момент полного
+# падения, т.к. адресат определялся только через NocoDB).
 # ────────────────────────────────────────────────────────────────────────────
+cache_admin_chat_id() {
+    local cid="$1"
+    [ -n "$cid" ] && printf '%s' "$cid" > "$ADMIN_CHAT_FILE" 2>/dev/null || true
+}
+
 resolve_admin_chat_id() {
     local cid
+    # 1. Живой источник — NocoDB (кэш обновляется при каждом успешном ответе)
     cid=$(get_admin_chat_id)
-    if [ -z "$cid" ] && [ -n "${TELEGRAM_USER_ID:-}" ]; then
-        cid=$(printf '%s' "$TELEGRAM_USER_ID" | tr -d '"')
+    if [ -n "$cid" ]; then
+        cache_admin_chat_id "$cid"
+        printf '%s' "$cid"
+        return 0
     fi
-    printf '%s' "$cid"
+    # 2. NocoDB недоступна → кэш с диска (переживает падение)
+    if [ -s "$ADMIN_CHAT_FILE" ]; then
+        cid=$(cat "$ADMIN_CHAT_FILE" 2>/dev/null)
+        if [ -n "$cid" ]; then
+            printf '%s' "$cid"
+            return 0
+        fi
+    fi
+    # 3. Устаревший, но последний рубеж
+    if [ -n "${TELEGRAM_USER_ID:-}" ]; then
+        printf '%s' "$TELEGRAM_USER_ID" | tr -d '"'
+        return 0
+    fi
+    return 1
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -192,12 +228,14 @@ check_tg_pending() {
 # ────────────────────────────────────────────────────────────────────────────
 install_cron() {
     mkdir -p /mnt/data/logs 2>/dev/null || true
-    if crontab -l 2>/dev/null | grep -q "health-alert.sh"; then
-        echo -e "${YELLOW}ℹ️  Health-мониторинг уже в crontab${NC}"
-    else
-        (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
-        echo -e "${GREEN}✅ Health-мониторинг добавлен в crontab (каждые 5 минут)${NC}"
-    fi
+    # v4.51.1: строки cron ПЕРЕЗАПИСЫВАЮТСЯ актуальными (старые — с редиректом
+    # в $LOG_FILE — удаляются), а не пропускаются, если «уже есть». Иначе фикс
+    # дублей лога не доехал бы до установленных систем.
+    local cur
+    cur=$(crontab -l 2>/dev/null | grep -v 'health-alert\.sh' || true)
+    { printf '%s\n' "$cur"; echo "$CRON_JOB"; echo "$CRON_BOOT_JOB"; } | crontab -
+    echo -e "${GREEN}✅ Health-мониторинг в crontab (каждые 5 минут)${NC}"
+    echo -e "${GREEN}✅ Boot-отчёт в crontab (@reboot)${NC}"
     echo -e "${GREEN}✅ Лог: $LOG_FILE${NC}"
     run_checks
     exit 0
@@ -262,20 +300,140 @@ check_disk() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
+# Проверка целостности базы данных (v4.50.0, Волна 2)
+# Повреждённая SQLite после грубого ребута/сбоя диска — «тихий убийца»:
+# NocoDB может падать/терять данные без явной причины. integrity_check ловит
+# повреждение, алерт подсказывает лечение (restore-backup.sh --latest).
+# В run_checks — не чаще раза в сутки; из --boot — всегда (force=1).
+# ────────────────────────────────────────────────────────────────────────────
+check_db_integrity() {
+    local force="${1:-0}"
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+    [ -f "$DB_FILE" ] || return 0
+    local flag="$FLAG_DIR/health-db-corrupt"
+
+    if [ "$force" != "1" ]; then
+        local last=0 now
+        now=$(date +%s)
+        [ -f "$INTEGRITY_TICK_FILE" ] && last=$(cat "$INTEGRITY_TICK_FILE" 2>/dev/null || echo 0)
+        [ $((now - last)) -lt "$INTEGRITY_INTERVAL_SEC" ] && return 0
+        echo "$now" > "$INTEGRITY_TICK_FILE" 2>/dev/null || true
+    fi
+
+    local res
+    res=$(sqlite3 "$DB_FILE" "PRAGMA integrity_check;" 2>&1)
+    if [ "$res" = "ok" ]; then
+        if [ -f "$flag" ]; then
+            rm -f "$flag"
+            log "🟢 База данных цела (integrity_check = ok)"
+            local cid
+            cid=$(resolve_admin_chat_id)
+            [ -n "$cid" ] && send_tg "$cid" "🟢 Printed4U CRM: база данных снова цела."
+        fi
+        return 0
+    fi
+
+    if [ ! -f "$flag" ]; then
+        touch "$flag"
+        local cid hostname
+        cid=$(resolve_admin_chat_id)
+        hostname=$(hostname)
+        log "🔴 База данных ПОВРЕЖДЕНА (integrity_check: $res)"
+        if [ -n "$cid" ]; then
+            send_tg "$cid" "🔴 Printed4U CRM: база данных повреждена!
+integrity_check ≠ ok
+Сервер: $hostname
+Время: $(date '+%d.%m.%Y %H:%M')
+
+Восстановление из бэкапа:
+  bash modules/restore-backup.sh --latest
+Текущая база будет сохранена в backups/pre-restore-*.db."
+        else
+            log "⚠️ Не найден Telegram_ID Руководителя — алерт не отправлен"
+        fi
+    fi
+    return 1
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Boot-отчёт после перезагрузки сервера (v4.50.0, Волна 2)
+# Вызывается из cron @reboot. Ждёт подъёма NocoDB (до 120с), затем шлёт
+# Руководителю одно сводное сообщение: сервисы + целостность базы.
+# Отдельно от bot.js-beacon («бот запущен») — здесь статус ВСЕЙ системы.
+# ────────────────────────────────────────────────────────────────────────────
+cmd_boot() {
+    log "🔌 Boot-check: сервер поднялся после перезагрузки"
+    local attempt=0
+    while [ "$attempt" -lt 40 ]; do
+        curl -fsS -m 3 -o /dev/null "http://localhost:8081/" 2>/dev/null && break
+        attempt=$((attempt + 1))
+        sleep 3
+    done
+    sleep 10 # дать подняться bot/webhook (depends_on: nocodb healthy)
+
+    local s_noco s_bot s_web s_db cid hostname res
+    curl -fsS -m 5 -o /dev/null "http://localhost:8081/" 2>/dev/null && s_noco="✅" || s_noco="🔴"
+    curl -fsS -m 5 -o /dev/null "http://localhost:3000/health" 2>/dev/null && s_bot="✅" || s_bot="🔴"
+    curl -fsS -m 5 -o /dev/null "http://localhost:3001/health" 2>/dev/null && s_web="✅" || s_web="🔴"
+    if command -v sqlite3 >/dev/null 2>&1 && [ -f "$DB_FILE" ]; then
+        res=$(sqlite3 "$DB_FILE" "PRAGMA integrity_check;" 2>&1)
+        [ "$res" = "ok" ] && s_db="✅ цела" || s_db="🔴 ПОВРЕЖДЕНА"
+        # Если повреждена — алерт с лечением пойдёт отдельно (check_db_integrity force)
+        check_db_integrity 1
+    else
+        s_db="ℹ️ не проверена (нет sqlite3/файла)"
+    fi
+
+    cid=$(resolve_admin_chat_id)
+    hostname=$(hostname)
+    local msg
+    msg=$(printf '🟢 Printed4U CRM: сервер поднялся\nСервер: %s\nВремя: %s\n\nNocoDB:  %s\nБот:     %s\nWebhook: %s\nБаза:    %s\n' \
+        "$hostname" "$(date '+%d.%m.%Y %H:%M')" "$s_noco" "$s_bot" "$s_web" "$s_db")
+    log "$msg"
+    if [ -n "$cid" ]; then
+        send_tg "$cid" "$msg"
+    else
+        log "⚠️ Не найден Telegram_ID Руководителя — boot-отчёт не отправлен"
+    fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Heartbeat healthchecks.io (v4.52.0, Волна 3 — внешний мониторинг)
+# Если сервер лёг ЦЕЛИКОМ (свет/интернет) — локальные алерты молчат по
+# определению. Исходящий пинг на healthchecks.io каждые 5 минут (этот cron-тик);
+# пропали пинги дольше grace (~15-20 мин, задаётся при создании чека) — сервис
+# шлёт владельцу «сервер недоступен». Успешный пинг НЕ логируем (не спамить лог
+# 288 раз в сутки), ошибку — логируем (диагностика).
+# ────────────────────────────────────────────────────────────────────────────
+heartbeat_ping() {
+    [ -n "${HEALTHCHECKS_URL:-}" ] || return 0
+    if curl -fsS -m 10 "${HEALTHCHECKS_URL}" >/dev/null 2>&1; then
+        return 0
+    fi
+    log "⚠️ Heartbeat: пинг на healthchecks.io не прошёл (нет интернета или сервис недоступен)"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
 # Разовая проверка всех сервисов
 # ────────────────────────────────────────────────────────────────────────────
 run_checks() {
     mkdir -p /mnt/data/logs 2>/dev/null || true
+    # v4.51.0: прогреваем кэш адресата алертов на КАЖДОМ тике (NocoDB жива) —
+    # чтобы при будущей аварии алерт гарантированно знал, кому писать.
+    resolve_admin_chat_id >/dev/null 2>&1 || true
     check_service nocodb  "http://localhost:8081/"   "NocoDB"
     check_service bot     "http://localhost:3000/health" "Telegram-бот"
     check_tg_pending   # v4.46.0 (Проблема 117): очередь апдейтов — поллинг жив?
     check_service webhook "http://localhost:3001/health" "Webhook"
     check_disk
+    check_db_integrity  # v4.50.0: целостность SQLite (не чаще раза в сутки)
+    heartbeat_ping      # v4.52.0 (Волна 3): внешний мониторинг healthchecks.io
 }
 
 # ────────────────────────────────────────────────────────────────────────────
 case "${1:-}" in
     --install) install_cron ;;
     --remove)  remove_cron  ;;
+    --boot)    cmd_boot     ;;
     *)         run_checks   ;;
 esac

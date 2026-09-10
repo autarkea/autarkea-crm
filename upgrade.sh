@@ -258,6 +258,9 @@ else
             fi
         fi
         log "   docker compose up -d --build ..."
+        # 📮 v4.49.0: каталог outbox-очереди должен существовать ДО старта бота
+        # (иначе bind-mount создаст его от root, и контейнерный UID не сможет писать).
+        mkdir -p /mnt/data/logs 2>/dev/null || true
         docker compose up -d --build 2>&1 | sed 's/^/   /' || err "docker compose up -d --build не удался"
     else
         err "docker-compose.yml не найден в $INSTALL_DIR"

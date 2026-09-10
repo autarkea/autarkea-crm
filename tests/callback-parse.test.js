@@ -9,7 +9,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { parseItemCallback } = require('../shared/callback-parse');
+const { parseItemCallback, parseCardCallback } = require('../shared/callback-parse');
 
 test('save/cancel — без проекта (берётся из черновика сессии)', () => {
     assert.deepEqual(parseItemCallback('pitem_save'), { kind: 'save', itemId: null, projectId: null, value: null });
@@ -51,4 +51,38 @@ test('Битые/чужие колбэки → null', () => {
     assert.equal(parseItemCallback('pitem_price_x_1'), null);      // битый itemId
     assert.equal(parseItemCallback('proj_items_5'), null);         // чужой префикс
     assert.equal(parseItemCallback('ptasks_5_0'), null);           // чужой префикс
+});
+
+// ============================================================================
+// v4.55.0: карточки контакта/юрлица + «возврат в проект» (хвостовой projectId)
+// ============================================================================
+test('ccard_{id} — карточка контакта без контекста проекта (старое поведение)', () => {
+    assert.deepEqual(parseCardCallback('ccard_7'), { kind: 'contact', id: 7, returnProjectId: null });
+    assert.deepEqual(parseCardCallback('ccard_15'), { kind: 'contact', id: 15, returnProjectId: null });
+});
+
+test('ccard_{id}_{projectId} — открыли из карточки проекта → возврат в проект', () => {
+    assert.deepEqual(parseCardCallback('ccard_7_42'), { kind: 'contact', id: 7, returnProjectId: 42 });
+    assert.deepEqual(parseCardCallback('ccard_123_1'), { kind: 'contact', id: 123, returnProjectId: 1 });
+});
+
+test('lcard_{id} / lcard_{id}_{projectId} — карточка юрлица', () => {
+    assert.deepEqual(parseCardCallback('lcard_3'), { kind: 'legal', id: 3, returnProjectId: null });
+    assert.deepEqual(parseCardCallback('lcard_3_42'), { kind: 'legal', id: 3, returnProjectId: 42 });
+});
+
+test('Нечисловой хвост трактуем как «без проекта» (старые кнопки не ломаются)', () => {
+    assert.deepEqual(parseCardCallback('ccard_7_back'), { kind: 'contact', id: 7, returnProjectId: null });
+});
+
+test('Битые/чужие колбэки карточек → null', () => {
+    assert.equal(parseCardCallback(null), null);
+    assert.equal(parseCardCallback(undefined), null);
+    assert.equal(parseCardCallback(''), null);
+    assert.equal(parseCardCallback('ccard_'), null);          // без id
+    assert.equal(parseCardCallback('ccard_x'), null);         // битый id
+    assert.equal(parseCardCallback('lcard_x_5'), null);       // битый id
+    assert.equal(parseCardCallback('pcard_5'), null);         // чужой префикс
+    assert.equal(parseCardCallback('ccard_back'), null);      // exact-колбэк, не карточка
+    assert.equal(parseCardCallback('lcard_back'), null);      // exact-колбэк, не карточка
 });

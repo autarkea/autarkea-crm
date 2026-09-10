@@ -7,7 +7,7 @@
 // ============================================================================
 
 module.exports = function createMainHandlers(ctx) {
-    const { parseItemCallback } = require('../shared/callback-parse');
+    const { parseItemCallback, parseCardCallback } = require('../shared/callback-parse');
     const {
         bot, config, axios, noco, sessions, employeesCache,
         STATE, ROLES, roles, PROJECT_STATUSES, PROJECT_INACTIVE_STATUSES,
@@ -20,7 +20,10 @@ module.exports = function createMainHandlers(ctx) {
         showProjectSelectionForTask,
         showProjectAfterCreate, handleTaskDeadlineChosen, transferProject, createProjectRecord,
         sendTaskList, sendTodayTasks, sendTaskHistory, sendTaskDetails,
+        sendTaskListFromCtx, // v4.53.0: возврат в исходный список из карточки задачи
         sendContactsList, sendContactDetails, sendLegalList, sendLegalDetails,
+        // v4.54.0: поиск по справочникам (кнопка «🔍» в списке контактов/юрлиц)
+        showBookSearchPrompt, sendBookSearchResults,
         sendProjectsList, sendProjectDetails, sendProjectStatusMenu,
         sendProjectTasksList, sendProjectItemsList, sendProjectItemDetails,
         sendProjectDocsList, sendDocCard, sendDocCreateConfirm, generateDocPdfAndSend,
@@ -564,7 +567,9 @@ async function handleCallbackBlockA(callbackQuery) {
             bot.answerCallbackQuery(callbackQuery.id);
             const cbTelegramId = callbackQuery.from?.id;
             const emp = cbTelegramId ? getEmployee(cbTelegramId) : null;
-            await sendTaskList(chatId, msg.message_id, cbTelegramId, emp ? emp.Роль : ROLES.EXECUTOR, getListPage(cbTelegramId, 'tl'));
+            // v4.53.0: возврат в ТОТ список, откуда открыли карточку (На сегодня /
+            // История / Задачи проекта / Все задачи). ctx запоминают рендеры списков.
+            await sendTaskListFromCtx(chatId, msg.message_id, sess.taskListCtx, cbTelegramId, emp ? emp.Роль : ROLES.EXECUTOR);
             return;
         }
         if (data.startsWith('view_')) {
@@ -597,8 +602,10 @@ async function handleCallbackBlockA(callbackQuery) {
                 }
             }
 
+            // v4.53.0 (скорость): задача уже получена для guard'а прав — отдаём её рендеру,
+            // чтобы не делать второй GET в NocoDB (минус один запрос на горячем пути).
             bot.answerCallbackQuery(callbackQuery.id);
-            await sendTaskDetails(chatId, msg.message_id, taskId, role);
+            await sendTaskDetails(chatId, msg.message_id, taskId, role, task);
             return;
         }
 
@@ -607,12 +614,24 @@ async function handleCallbackBlockA(callbackQuery) {
             bot.answerCallbackQuery(callbackQuery.id);
             const cbTelegramId = callbackQuery.from?.id;
             const emp = cbTelegramId ? getEmployee(cbTelegramId) : null;
-            await sendContactsList(chatId, cbTelegramId, emp ? emp.Роль : ROLES.EXECUTOR, msg.message_id, getListPage(cbTelegramId, 'cl'));
+            const role = emp ? emp.Роль : ROLES.EXECUTOR;
+            // v4.54.0: карточку открыли из результатов поиска — «Назад» возвращает в
+            // ТЕ ЖЕ результаты (ctx.contactBookCtx), а не на страницу полного списка:
+            // иначе после просмотра карточки найденный контакт «теряется» в листании.
+            const bookCtx = sess.contactBookCtx;
+            if (bookCtx && bookCtx.query) {
+                await sendBookSearchResults(chatId, cbTelegramId, role, bookCtx.query, 'cl', msg.message_id);
+            } else {
+                await sendContactsList(chatId, cbTelegramId, role, msg.message_id, getListPage(cbTelegramId, 'cl'));
+            }
             return;
         }
         if (data.startsWith('ccard_')) {
-            const contactId = parseInt(data.split('_')[1]);
-            if (!Number.isInteger(contactId)) return;
+            // v4.55.0: карточку можно открыть из карточки проекта — тогда в колбэке есть
+            // хвостовой projectId (ccard_{contactId}_{projectId}) → «⬅️ К проекту».
+            const parsed = parseCardCallback(data);
+            if (!parsed) return;
+            const contactId = parsed.id;
             const cbTelegramId = callbackQuery.from?.id;
             const emp = cbTelegramId ? getEmployee(cbTelegramId) : null;
             const role = emp ? emp.Роль : ROLES.EXECUTOR;
@@ -624,7 +643,8 @@ async function handleCallbackBlockA(callbackQuery) {
             // v4.26.0: Менеджер видит ВСЮ клиентскую базу — проверка canManagerSeeContact удалена.
 
             bot.answerCallbackQuery(callbackQuery.id);
-            await sendContactDetails(chatId, msg.message_id, contactId, role, cbTelegramId);
+            const backTo = parsed.returnProjectId ? `pcard_${parsed.returnProjectId}` : 'ccard_back';
+            await sendContactDetails(chatId, msg.message_id, contactId, role, cbTelegramId, backTo);
             return;
         }
 
@@ -633,12 +653,21 @@ async function handleCallbackBlockA(callbackQuery) {
             bot.answerCallbackQuery(callbackQuery.id);
             const cbTelegramId = callbackQuery.from?.id;
             const emp = cbTelegramId ? getEmployee(cbTelegramId) : null;
-            await sendLegalList(chatId, cbTelegramId, emp ? emp.Роль : ROLES.EXECUTOR, msg.message_id, getListPage(cbTelegramId, 'll'));
+            const role = emp ? emp.Роль : ROLES.EXECUTOR;
+            // v4.54.0: возврат в результаты поиска юрлиц, если карточку открыли из них.
+            const bookCtx = sess.legalBookCtx;
+            if (bookCtx && bookCtx.query) {
+                await sendBookSearchResults(chatId, cbTelegramId, role, bookCtx.query, 'll', msg.message_id);
+            } else {
+                await sendLegalList(chatId, cbTelegramId, role, msg.message_id, getListPage(cbTelegramId, 'll'));
+            }
             return;
         }
         if (data.startsWith('lcard_')) {
-            const legalId = parseInt(data.split('_')[1]);
-            if (!Number.isInteger(legalId)) return;
+            // v4.55.0: из карточки проекта — хвостовой projectId → «⬅️ К проекту».
+            const parsed = parseCardCallback(data);
+            if (!parsed) return;
+            const legalId = parsed.id;
             const cbTelegramId = callbackQuery.from?.id;
             const emp = cbTelegramId ? getEmployee(cbTelegramId) : null;
             const role = emp ? emp.Роль : ROLES.EXECUTOR;
@@ -650,7 +679,25 @@ async function handleCallbackBlockA(callbackQuery) {
             // v4.26.0: Менеджер видит ВСЕ юрлица — проверка canManagerSeeLegal удалена.
 
             bot.answerCallbackQuery(callbackQuery.id);
-            await sendLegalDetails(chatId, msg.message_id, legalId, role, cbTelegramId);
+            const backTo = parsed.returnProjectId ? `pcard_${parsed.returnProjectId}` : 'lcard_back';
+            await sendLegalDetails(chatId, msg.message_id, legalId, role, cbTelegramId, backTo);
+            return;
+        }
+
+        // ================== v4.54.0: ПОИСК ПО СПРАВОЧНИКАМ (кнопка «🔍» в списке) ==================
+        // Запрос текста рисуется на МЕСТЕ списка (edit), повторные «Уточнить запрос»
+        // не засоряют чат. Guard Менеджер+ — центральный (routes.MANAGER_ONLY) + здесь.
+        if (data === 'cc_search' || data === 'll_search') {
+            const isLegalSearch = data === 'll_search';
+            const cbTelegramId = callbackQuery.from?.id;
+            const emp = cbTelegramId ? getEmployee(cbTelegramId) : null;
+            const role = emp ? emp.Роль : ROLES.EXECUTOR;
+            if (role === ROLES.EXECUTOR) {
+                bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ У вас нет доступа к контактам' });
+                return;
+            }
+            bot.answerCallbackQuery(callbackQuery.id);
+            await showBookSearchPrompt(chatId, msg.message_id, isLegalSearch ? 'll' : 'cl');
             return;
         }
 
@@ -1524,8 +1571,10 @@ async function handleCallbackBlockA(callbackQuery) {
             await axios.patch(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.TASKS}/${taskId}`, { 'Готово': true }, { headers: { 'xc-token': config.NOCO_TOKEN } });
             invalidateTaskListCache(); // v4.43.1: задача закрыта — список, который перерисуем ниже, будет свежим
             bot.answerCallbackQuery(callbackQuery.id, { text: '✅ Задача закрыта!' });
-            // v4.36.1: действия — только в карточке; после закрытия возврат во «Все задачи»
-            await sendTaskList(chatId, msg.message_id, cbTelegramId, role, getListPage(cbTelegramId, 'tl'));
+            // v4.36.1: действия — только в карточке; v4.53.0: возврат в ТОТ список,
+            // откуда открыли карточку («На сегодня»/«История»/«Задачи проекта»),
+            // а не «Все задачи». Если ctx нет — фоллбэк на «Все задачи» (старое поведение).
+            await sendTaskListFromCtx(chatId, msg.message_id, sess.taskListCtx, cbTelegramId, role);
             return;
         }
         if (data === 'refresh_tasks') {

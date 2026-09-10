@@ -27,7 +27,7 @@
 # - Модуль настройки бэкапов (modules/backup-install.sh): локальные по
 #   расписанию (дни + время) + облачные (Google Drive через rclone)
 # - Бейдж версии синхронизирован с docs (ранее рассогласование v4.8.1)
-# - NocoDB CE 2026.08.2 (актуализирован бейдж, v4.48.0)
+# - NocoDB CE 2026.08.2 (актуализирован бейдж, v4.51.0)
 # ============================================================================
 # Изменения v4.8.1:
 # - SMTP вынесен в отдельный модуль modules/email-install.sh
@@ -46,8 +46,8 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 echo -e "${BLUE}═══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║   Printed4U CRM - Установка v4.48.0                    ║${NC}"
-echo -e "${BLUE}║   Бэкапы + Watchdog FS + Роли + Документы (B2B/B2C)    ║${NC}"
+echo -e "${BLUE}║   Printed4U CRM - Установка v4.51.0                    ║${NC}"
+echo -e "${BLUE}║   Безотказность+Restore+Смоук R1-R4 + Бэкапы+Роли   ║${NC}"
 echo -e "${BLUE}║   NocoDB CE 2026.08.2 (Зафиксированная версия)         ║${NC}"
 echo -e "${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
 echo ""
@@ -95,7 +95,26 @@ else
     echo -e "${GREEN}✅ Docker Compose: $(docker compose version)${NC}"
 fi
 
-for cmd in git curl jq; do
+# 🔌 v4.50.0 (Волна 2, безотказность): Docker обязан стартовать сам после
+# перезагрузки сервера — иначе «свет дали, а CRM не поднялась».
+if command -v systemctl &> /dev/null; then
+    if systemctl is-enabled docker &> /dev/null; then
+        echo -e "${GREEN}✅ Docker в автозапуске (systemd)${NC}"
+    else
+        if sudo systemctl enable docker &> /dev/null; then
+            echo -e "${GREEN}✅ Автозапуск Docker включён (systemctl enable docker)${NC}"
+        else
+            echo -e "${YELLOW}⚠️  Не удалось включить автозапуск Docker. Сделай вручную: sudo systemctl enable docker${NC}"
+        fi
+    fi
+else
+    echo -e "${YELLOW}ℹ️  systemd не найден — включи автозапуск Docker средствами своей системы инициализации${NC}"
+fi
+
+# 🔧 v4.50.1 (найдено смоуком на чистой VM): sqlite3 нужен ДЛЯ УСТАНОВКИ
+# (modules/version.sh пишет версию схемы в nc_store напрямую на хосте) и для
+# эксплуатации (restore-backup.sh, health-alert.sh integrity_check).
+for cmd in git curl jq sqlite3; do
     if ! command -v $cmd &> /dev/null; then
         sudo apt-get update -qq
         sudo apt-get install -y -qq $cmd
@@ -109,7 +128,7 @@ echo ""
 # ============================================================================
 echo -e "${BLUE}📁 Шаг 2/8: Создание папок для данных...${NC}"
 DATA_DIR="/mnt/data"
-sudo mkdir -p $DATA_DIR/{projects,clients,noco-static/pdfs,backups,nocodb-data}
+sudo mkdir -p $DATA_DIR/{projects,clients,noco-static/pdfs,backups,nocodb-data,logs}
 sudo chown -R $USER:$USER $DATA_DIR
 
 # 🔒 v4.12.0: Безопасные права на каркас файловой системы
@@ -120,6 +139,7 @@ sudo chmod 0755 $DATA_DIR/clients
 sudo chmod 0755 $DATA_DIR/noco-static
 sudo chmod 0775 $DATA_DIR/noco-static/pdfs  # PDF пишут контейнеры
 sudo chmod 0700 $DATA_DIR/backups
+sudo chmod 0755 $DATA_DIR/logs  # 📮 v4.49.0: outbox-очередь бота (пишет контейнер от ${APP_UID})
 sudo chmod 0755 $DATA_DIR/nocodb-data
 
 # 🖼 v4.31.0: Папка пользовательской печати организации.
@@ -475,7 +495,7 @@ echo -e "${MAGENTA}════════════════════�
 
 # --- 1. Telegram бот ---
 echo ""
-echo -e "${BLUE}🤖 [1/4] Настроить Telegram бота?${NC}"
+echo -e "${BLUE}🤖 [1/5] Настроить Telegram бота?${NC}"
 read -p "(y/n, по умолчанию y): " install_bot
 install_bot=${install_bot:-y}
 if [[ "$install_bot" == "y" || "$install_bot" == "Y" ]]; then
@@ -488,7 +508,7 @@ fi
 
 # --- 2. Samba + Защита файловой системы ---
 echo ""
-echo -e "${BLUE}📂 [2/4] Настроить сетевые папки Samba (доступ из Windows)?${NC}"
+echo -e "${BLUE}📂 [2/5] Настроить сетевые папки Samba (доступ из Windows)?${NC}"
 echo -e "${YELLOW}   Вместе с Samba установится watchdog — автопочинка структуры папок (cron, каждые 5 минут)${NC}"
 read -p "(y/n, по умолчанию y): " install_samba
 install_samba=${install_samba:-y}
@@ -511,7 +531,7 @@ fi
 
 # --- 3. Email (SMTP) — НОВЫЙ МОДУЛЬ v4.8.1 ---
 echo ""
-echo -e "${BLUE}📧 [3/4] Настроить Email-отправку (SMTP)?${NC}"
+echo -e "${BLUE}📧 [3/5] Настроить Email-отправку (SMTP)?${NC}"
 echo -e "${YELLOW}   Нужна для отправки PDF-документов клиентам.${NC}"
 echo -e "${YELLOW}   Если пропустишь — сможешь настроить позже:${NC}"
 echo -e "${CYAN}   bash modules/email-install.sh${NC}"
@@ -528,7 +548,7 @@ fi
 
 # --- 4. Бэкапы (локальные + облачные) — НОВЫЙ МОДУЛЬ v4.12.0 ---
 echo ""
-echo -e "${BLUE}💾 [4/4] Настроить резервное копирование (локальное + облачное)?${NC}"
+echo -e "${BLUE}💾 [4/5] Настроить резервное копирование (локальное + облачное)?${NC}"
 echo -e "${YELLOW}   Локальные: полный снапшот (база + проекты + клиенты + PDF) по расписанию.${NC}"
 echo -e "${YELLOW}   Облачные: Google Drive через rclone. Статус — в Telegram: /backup.${NC}"
 echo -e "${YELLOW}   Если пропустишь — сможешь настроить позже:${NC}"
@@ -542,6 +562,27 @@ if [[ "$install_backup" == "y" || "$install_backup" == "Y" ]]; then
         echo -e "${RED}❌ modules/backup-install.sh не найден!${NC}"
         echo -e "${YELLOW}💡 Убедись, что модуль создан и имеет права на выполнение.${NC}"
     fi
+fi
+
+# --- 5. Внешний мониторинг (heartbeat healthchecks.io) — v4.52.0, Волна 3 ---
+echo ""
+echo -e "${BLUE}💓 [5/5] Настроить внешний мониторинг (healthchecks.io)?${NC}"
+echo -e "${YELLOW}   Если сервер ляжет ЦЕЛИКОМ (свет/интернет) — healthchecks.io пришлёт${NC}"
+echo -e "${YELLOW}   алерт владельцу («сервер недоступен»). Порты наружу НЕ открываются.${NC}"
+echo -e "${YELLOW}   Для установок «под ключ»: создай чек в аккаунте интегратора (API-ключ).${NC}"
+echo -e "${YELLOW}   Если пропустишь — сможешь настроить позже:${NC}"
+echo -e "${CYAN}   bash modules/heartbeat-install.sh${NC}"
+read -p "(y/n, по умолчанию n): " install_heartbeat
+install_heartbeat=${install_heartbeat:-n}
+if [[ "$install_heartbeat" == "y" || "$install_heartbeat" == "Y" ]]; then
+    if [ -f "modules/heartbeat-install.sh" ]; then
+        bash modules/heartbeat-install.sh
+    else
+        echo -e "${YELLOW}⚠️  modules/heartbeat-install.sh не найден (код устарел — обнови)${NC}"
+    fi
+else
+    echo -e "${YELLOW}ℹ️  Внешний мониторинг пропущен. Включить позже:${NC}"
+    echo -e "${YELLOW}   bash modules/heartbeat-install.sh${NC}"
 fi
 
 # 🛡 v4.24.0: Health-мониторинг сервисов + алерт Руководителю (безотказность)

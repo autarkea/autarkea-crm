@@ -33,6 +33,9 @@ test('Дефолтная сессия: state=idle и ВСЕ черновики �
     assert.ok(s.projectDraft, 'projectDraft должен существовать');
     assert.ok(s.itemDraft, 'itemDraft должен существовать (v4.42.1: визард позиции заказа)');
     assert.ok(s.pendingContactAction, 'pendingContactAction должен существовать');
+    assert.equal(s.taskListCtx, null, 'taskListCtx: null (v4.53.0: «вернись, откуда пришёл»)');
+    assert.equal(s.contactBookCtx, null, 'contactBookCtx: null (v4.54.0: контекст списка контактов)');
+    assert.equal(s.legalBookCtx, null, 'legalBookCtx: null (v4.54.0: контекст списка юрлиц)');
 });
 
 test('itemDraft содержит все поля визарда позиции заказа (v4.42.1)', () => {

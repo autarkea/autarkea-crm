@@ -36,6 +36,7 @@ services:
       - /mnt/data/clients:/mnt/data/clients
       - /mnt/data/noco-static:/mnt/data/noco-static
       - /mnt/data/backups:/mnt/data/backups:ro # 💾 v4.12.0: статус бэкапов в /backup (bot.js)
+      - /mnt/data/logs:/mnt/data/logs # 📮 v4.49.0: outbox-очередь исходящих уведомлений (переживает рестарт/reboot)
       - ${RCLONE_CONF:-/dev/null}:/home/node/.config/rclone/rclone.conf:ro # 💾 v4.34.0: облачные бэкапы в /backup (Проблемы 108+109; путь — из .env, переживает git pull; dest = home юзера node, контейнер идёт от user ${APP_UID} и /root ему недоступен)
     ports:
       - "3000:3000"

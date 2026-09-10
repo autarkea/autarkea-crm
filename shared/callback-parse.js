@@ -73,4 +73,39 @@ function parseItemCallback(data) {
     }
 }
 
-module.exports = { parseItemCallback };
+// ============================================================================
+// Разбор callback_data карточек КОНТАКТА/ЮРЛИЦА (v4.55.0)
+// ----------------------------------------------------------------------------
+// Зачем: карточку клиента можно открыть не только из списка, но и из карточки
+// проекта («🏢/👤 Открыть клиента»). Чтобы «⬅️ Назад» вернул обратно в проект,
+// в колбэк добавлен ХВОСТОВОЙ projectId (тот же приём, что у pitem_*).
+//
+// Форматы:
+//   ccard_{id}              → { kind:'contact', id, returnProjectId:null }
+//   ccard_{id}_{projectId}  → { kind:'contact', id, returnProjectId }
+//   lcard_{id}              → { kind:'legal',   id, returnProjectId:null }
+//   lcard_{id}_{projectId}  → { kind:'legal',   id, returnProjectId }
+//
+// Битый/чужой колбэк → null (диспетчер молчит). Нечисловой хвост трактуем как
+// отсутствие контекста (returnProjectId:null) — старые кнопки не ломаются.
+// ============================================================================
+function parseCardCallback(data) {
+    if (typeof data !== 'string') return null;
+    let kind = null;
+    if (data.startsWith('ccard_')) kind = 'contact';
+    else if (data.startsWith('lcard_')) kind = 'legal';
+    else return null;
+
+    const P = data.split('_');
+    const id = parseInt(P[1], 10);
+    if (!Number.isInteger(id)) return null;
+
+    let returnProjectId = null;
+    if (P.length >= 3) {
+        const pid = parseInt(P[2], 10);
+        if (Number.isInteger(pid)) returnProjectId = pid;
+    }
+    return { kind, id, returnProjectId };
+}
+
+module.exports = { parseItemCallback, parseCardCallback };

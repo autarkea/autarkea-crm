@@ -92,10 +92,22 @@ const vat = require('./shared/vat');
 // справочники — алфавит. Сортировать ТОЛЬКО этим модулем (см. документацию).
 const sorters = require('./shared/sorting');
 
+// v4.54.0: единые предикаты поиска по справочникам (Контакты/Юрлица). Раньше
+// фильтр был задублирован в трёх местах этого файла (поиск клиента в визарде
+// проекта v4.16.0, поиск юрлица для привязки v4.43.0) — теперь один источник
+// в shared/search.js (тесты: tests/search.test.js). Используется и новым
+// поиском прямо из списков «📇 Контакты» / «🏢 Юрлица».
+const bookSearch = require('./shared/search');
+
 // v4.46.0 (Проблема 117): watchdog Telegram-поллинга. Чистая логика решения
 // «завис ли поллинг» — shared/watchdog.js (тесты: tests/watchdog.test.js).
 // Здесь — только «сердцебиение» (lastIncomingUpdateAt) и реакция (рестарт).
 const pollWatchdog = require('./shared/watchdog');
+
+// v4.49.0 (Волна 1 безотказности): персистентная очередь исходящих уведомлений
+// (shared/outbox.js, тесты: tests/outbox.test.js). Каталог — на диске /mnt/data
+// (смонтирован в контейнер), а не в /tmp: переживает docker restart и reboot.
+const outbox = require('./shared/outbox');
 
 // 🆕 v4.17.0: Статусы проекта. Должны совпадать с вариантами Select «Статус»
 // в таблице «Проекты» NocoDB (см. документацию, раздел «Статусы проекта»).
@@ -156,12 +168,15 @@ async function loadAllowedUsers() {
                         const created = task['CreatedAt'] ? new Date(task['CreatedAt']) : null;
                         const ageMin = created ? (Date.now() - created.getTime()) / 60000 : 999;
                         if (ageMin < 2) {
-                            notifiedTasks.add(key);
                             const projectRef = task['Какой проект'] ? ` (проект: ${task['Какой проект']['Что делаем?']})` : '';
-                            bot.sendMessage(Number(tgId),
-                                `📋 *Тебе назначена задача #${task.Id}*${projectRef}\n\n📝 ${task['Что делаем?']}\n${task['Когда делаем'] ? '📅 ' + formatMinskDate(task['Когда делаем']) : '⏰ Без срока'}\n\nНажми «Мои задачи» чтобы увидеть все.`,
-                                { parse_mode: 'Markdown' }
-                            ).catch(() => {});
+                            // v4.49.0 (Волна 1): ключ отмечаем ТОЛЬКО при реальной доставке.
+                            // 'queued' → запись в outbox, flush отметит ключ после доставки;
+                            // 'dropped' → попробуем следующим тиком (через 60 сек).
+                            const res = await sendReliable(key, Number(tgId),
+                                `📋 *Тебе назначена задача #${task.Id}*${projectRef}\n\n📝 ${task['Что делаем?']}\n${task['Когда делаем'] ? '📅 ' + formatMinskDate(task['Когда делаем']) : '⏰ Без срока'}`,
+                                { journal: 'tasks', replyMarkup: taskOpenKeyboard(task.Id) }
+                            );
+                            if (res === 'sent') notifiedTasks.add(key);
                         } else {
                             // Старая задача — просто отмечаем как увиденную
                             notifiedTasks.add(key);
@@ -279,7 +294,11 @@ const STATE = {
     // v4.43.0: ввод нового значения поля карточки контакта/юрлица («✏️ Изменить»)
     WAITING_EDIT_VALUE: 'waiting_edit_value',
     // v4.43.0: поиск юрлица для привязки к контакту («🏢 Привязать юрлицо» в карточке контакта)
-    WAITING_ORG_SEARCH: 'waiting_org_search'
+    WAITING_ORG_SEARCH: 'waiting_org_search',
+    // v4.54.0: поиск по справочникам — кнопка «🔍 Найти контакт/юрлицо» в списке
+    // поставила state, ждём текст запроса. 'cl' — контакты, 'll' — юрлица.
+    WAITING_CONTACT_BOOK_SEARCH: 'waiting_contact_book_search',
+    WAITING_LEGAL_BOOK_SEARCH: 'waiting_legal_book_search'
 };
 
 // v4.29.0: состояние ВСЕХ визардов бота (создание задачи/проекта/контакта/юрлица,
@@ -363,6 +382,122 @@ function schedulePollRestart(reason) {
         process.exit(1);
     }, 3000);
 }
+
+// =============== НАДЁЖНАЯ ОТПРАВКА + ПЕРСИСТЕНТНАЯ ОЧЕРЕДЬ (v4.49.0) ================
+// Проблема: при недоступности Telegram (у сервера пропал интернет) sendMessage
+// падал, ошибка глоталась .catch(()=>{}), а ключ журнала уже был «выдан»
+// (add ДО отправки) → уведомление терялось навсегда, пока жив процесс
+// (дедлайны 1h/due/late2h, назначение задачи, утренняя сводка).
+// Решение: sendReliable() — сначала живая отправка; не ушло → запись в
+// персистентную очередь shared/outbox.js (/mnt/data/logs/outbox). flushOutbox()
+// доставляет накопленное после восстановления связи и ТОЛЬКО тогда отмечает
+// ключ в Set-журнале (защита от дублей в следующих тиках). Очередь переживает
+// и docker restart, и reboot хоста — потерянных уведомлений больше нет.
+const OUTBOX_DIR = '/mnt/data/logs/outbox';
+const OUTBOX_FLUSH_MS = 30 * 1000;                      // как часто пробуем доставить
+const OUTBOX_DEAD_AFTER_MS = 24 * 60 * 60 * 1000;       // запись старше суток не пытаемся слать
+
+function outboxBackoffMs(attempts) {
+    // 30с → 1м → 2м → 4м → 8м → 15м (cap): при долгом обрыве не долбим Telegram.
+    return Math.min(30 * 1000 * 2 ** Math.min(attempts, 5), 15 * 60 * 1000);
+}
+
+// Удаление записи по ФАКТИЧЕСКОМУ имени файла (_file), если оно известно.
+// v4.51.0 (итог смоука R3): удаление по id не находило файл при рассинхроне
+// имени с id → запись оставалась и доставлялась повторно (дубли).
+function outboxDrop(dir, rec) {
+    return rec && rec._file
+        ? outbox.removeFile(dir, rec._file)
+        : outbox.remove(dir, rec && rec.id);
+}
+
+// v4.53.0: inline-кнопка «👁 Открыть задачу» в уведомлениях (назначение/дедлайны).
+// Один клик до карточки задачи — сотруднику не нужно блуждать по меню. Безопасность
+// открытия уже закрыта guard'ом владения в ветке view_ (своя задача/своя заявка/
+// задача своего проекта), Руководитель видит всё — отдельные проверки не нужны.
+function taskOpenKeyboard(taskId) {
+    return { inline_keyboard: [[{ text: '👁 Открыть задачу', callback_data: `view_${taskId}` }]] };
+}
+
+/**
+ * Надёжная отправка системного уведомления.
+ * @param {string} id    уникальный ключ; у напоминаний = ключ журнала
+ *                       (`<taskId>_<tgId>_due` и т.п.) → дубликат не создастся.
+ * @param {number} chatId
+ * @param {string} text  готовый текст (уже экранирован под Markdown)
+ * @param {Object} [opts] { journal: 'tasks'|'deadlines'|null, parseMode, replyMarkup }
+ * @returns {'sent'|'queued'|'dropped'}
+ */
+async function sendReliable(id, chatId, text, opts = {}) {
+    const { journal = null, parseMode = 'Markdown', replyMarkup = null } = opts;
+    if (outbox.has(OUTBOX_DIR, id)) return 'queued'; // уже ждёт — flush доставит
+    try {
+        const sendOpts = { parse_mode: parseMode };
+        if (replyMarkup) sendOpts.reply_markup = replyMarkup;
+        await bot.sendMessage(Number(chatId), text, sendOpts);
+        return 'sent';
+    } catch (err) {
+        console.error(`📮 Очередь: ${id} не отправлено сразу (${err.message}) — кладу в outbox`);
+        return outbox.append(OUTBOX_DIR, { id, chatId, text, parseMode, replyMarkup, journal }) ? 'queued' : 'dropped';
+    }
+}
+
+// Отметить ключ в правильном Set-журнале ПОСЛЕ реальной доставки из очереди.
+function markReliableDelivered(rec) {
+    if (rec.journal === 'deadlines') notifiedDeadlines.add(rec.id);
+    else if (rec.journal === 'tasks') notifiedTasks.add(rec.id);
+}
+
+// Доставка накопленного. Журнал помечаем ДО удаления записи: если процесс упадёт
+// между sendMessage и удалением — при следующем flush уйдёт дубль, но не потеря.
+async function flushOutbox() {
+    const records = outbox.list(OUTBOX_DIR);
+    if (records.length === 0) return;
+    const now = Date.now();
+    for (const rec of records) {
+        if (rec.nextAttemptAt && rec.nextAttemptAt > now) continue; // backoff
+        if (now - (rec.createdAt || now) > OUTBOX_DEAD_AFTER_MS) {
+            outboxDrop(OUTBOX_DIR, rec);
+            console.error(`📮 Очередь: ${rec.id} старше суток — удалена без доставки (проверь вручную)`);
+            continue;
+        }
+        try {
+            const sendOpts = rec.parseMode ? { parse_mode: rec.parseMode } : {};
+            // v4.53.0: запись из очереди может нести inline-клавиатуру (replyMarkup)
+            // — flush доставляет её вместе с текстом. Старые записи без поля шлются как раньше.
+            if (rec.replyMarkup) sendOpts.reply_markup = rec.replyMarkup;
+            await bot.sendMessage(Number(rec.chatId), rec.text, sendOpts);
+            markReliableDelivered(rec);
+            if (!outboxDrop(OUTBOX_DIR, rec)) {
+                console.error(`📮 Очередь: ${rec.id} доставлено, но файл не удалён — будет повтор (проверь каталог)`);
+            }
+            console.log(`📮 Очередь: доставлено ${rec.id}`);
+        } catch (err) {
+            const errMsg = (err && err.message) || String(err);
+            // v4.51.0 (итог смоука R3): «смертельные» ошибки Telegram — чат не
+            // существует / бот заблокирован / пользователь деактивирован. Такое
+            // сообщение НИКОГДА не доставится — долбить 20 попыток бессмысленно,
+            // удаляем сразу (попытки остальных записей не задерживаются).
+            if (/400|403|404|chat not found|bot was blocked|user is deactivated|Forbidden:|can't parse entities/i.test(errMsg)) {
+                outboxDrop(OUTBOX_DIR, rec);
+                console.error(`📮 Очередь: ${rec.id} удалена (смертельная ошибка доставки: ${errMsg})`);
+                continue;
+            }
+            const attempts = (rec.attempts || 0) + 1;
+            if (attempts >= outbox.DEFAULTS.maxAttempts) {
+                outboxDrop(OUTBOX_DIR, rec);
+                console.error(`📮 Очередь: ${rec.id} не доставлено за ${attempts} попыток — удалена (проверь chat_id/текст)`);
+            } else {
+                outbox.update(OUTBOX_DIR, rec.id, { attempts, nextAttemptAt: now + outboxBackoffMs(attempts) });
+            }
+            console.error(`📮 Очередь: попытка ${attempts}, ${rec.id} не доставлено: ${errMsg}`);
+        }
+    }
+}
+
+// Первая доставка накопленного после старта/рестарта бота + периодический flush.
+setTimeout(flushOutbox, 15 * 1000);
+setInterval(flushOutbox, OUTBOX_FLUSH_MS);
 
 // ================== ГЛАВНОЕ МЕНЮ (Reply Keyboard, зависит от роли) ==================
 function buildMainMenu(role) {
@@ -1005,10 +1140,8 @@ async function showLegalSelectionForProject(chatId) {
 async function searchContacts(chatId, query) {
     try {
         const allContacts = await fetchAllRows(config.TABLES.CONTACTS);
-        const q = normalizeSearch(query);
-        const found = allContacts.filter(c => {
-            return [c['Имя'], c['Телефон'], c['Ссылка'], c['E-mail']].some(f => normalizeSearch(f).includes(q));
-        });
+        // v4.54.0: единый предикат поиска (shared/search.js) — раньше фильтр был здесь
+        const found = bookSearch.filterContactsByQuery(allContacts, query);
         if (found.length === 0) {
             const inlineKeyboard = [
                 [{ text: '🔍 Попробовать другой запрос', callback_data: 'proj_search_contact' }],
@@ -1037,10 +1170,8 @@ async function searchContacts(chatId, query) {
 async function searchLegalEntities(chatId, query) {
     try {
         const allLegals = await fetchAllRows(config.TABLES.LEGAL_ENTITIES);
-        const q = normalizeSearch(query);
-        const found = allLegals.filter(l => {
-            return [l['Краткое Имя'], l['Имя'], l['Телефон'], l['E-mail'], l['УНП'], l['Адрес']].some(f => normalizeSearch(f).includes(q));
-        });
+        // v4.54.0: единый предикат поиска (shared/search.js)
+        const found = bookSearch.filterLegalsByQuery(allLegals, query);
         if (found.length === 0) {
             const inlineKeyboard = [
                 [{ text: '🔍 Попробовать другой запрос', callback_data: 'proj_search_legal' }],
@@ -1074,13 +1205,9 @@ async function searchAllClients(chatId, query) {
             fetchAllRows(config.TABLES.CONTACTS),
             fetchAllRows(config.TABLES.LEGAL_ENTITIES)
         ]);
-        const q = normalizeSearch(query);
-        const foundContacts = contacts.filter(c => {
-            return [c['Имя'], c['Телефон'], c['Ссылка'], c['E-mail']].some(f => normalizeSearch(f).includes(q));
-        });
-        const foundLegals = legals.filter(l => {
-            return [l['Краткое Имя'], l['Имя'], l['Телефон'], l['E-mail'], l['УНП'], l['Адрес']].some(f => normalizeSearch(f).includes(q));
-        });
+        // v4.54.0: единые предикаты поиска (shared/search.js)
+        const foundContacts = bookSearch.filterContactsByQuery(contacts, query);
+        const foundLegals = bookSearch.filterLegalsByQuery(legals, query);
         const total = foundContacts.length + foundLegals.length;
         if (total === 0) {
             const inlineKeyboard = [
@@ -1303,6 +1430,7 @@ async function sendTodayTasks(chatId, telegramId, role, messageId, page = 0) {
         // 🆕 v4.22.0: UI-пагинация
         const { pageItems, page: safePage, totalPages } = slicePage(todayTasks, page, LIST_PAGE_SIZE.tasks);
         setListPage(telegramId, 'td', safePage);
+        setTaskListCtx(chatId, { kind: 'td', page: safePage }); // v4.53.0: «вернись сюда» после карточки
 
             let text = `📅 *Задачи на сегодня (${todayStart.toLocaleDateString('ru-RU')})* (${todayTasks.length})${totalPages > 1 ? ` · стр. ${safePage + 1}/${totalPages}` : ''}`;
     // 🆕 v4.36.0: список = кнопки-пункты; «✅ Закрыть» у каждой задачи (все они «горящие»).
@@ -1349,6 +1477,7 @@ async function sendTaskHistory(chatId, telegramId, role, messageId, page = 0) {
         // 🆕 v4.22.0: UI-пагинация
         const { pageItems, page: safePage, totalPages } = slicePage(recentDone, page, LIST_PAGE_SIZE.simple);
         setListPage(telegramId, 'hl', safePage);
+        setTaskListCtx(chatId, { kind: 'hl', page: safePage }); // v4.53.0: «вернись сюда» после карточки
 
             let text = `📜 *История задач (последние 7 дней)* (${recentDone.length})${totalPages > 1 ? ` · стр. ${safePage + 1}/${totalPages}` : ''}`;
     // 🆕 v4.36.0: список = кнопки-пункты (выполненные — только просмотр, действий нет)
@@ -1508,6 +1637,34 @@ bot.on('text', async (msg) => {
     if (text.startsWith('/') && sess.state !== STATE.IDLE) {
         if (text === '/skip' || text === '/cancel') return;
         resetState(chatId);
+    }
+
+    // ================== ПОИСК ПО СПРАВОЧНИКАМ: приём запроса (v4.54.0) ==================
+    // Кнопка «🔍 Найти контакт/юрлицо» в списке поставила state — здесь любой текст
+    // становится поисковым запросом. Обрабатываем ДО кнопок главного меню (иначе
+    // текст, совпавший с reply-кнопкой, ушёл бы в меню и молча затёр черновик).
+    if (sess.state === STATE.WAITING_CONTACT_BOOK_SEARCH || sess.state === STATE.WAITING_LEGAL_BOOK_SEARCH) {
+        if (text === '⬅️ Назад') {
+            resetState(chatId);
+            const empS = msg.from ? getEmployee(msg.from.id) : null;
+            bot.sendMessage(chatId, '❌ Поиск отменён.');
+            sendMainMenu(chatId, null, empS ? empS.Роль : ROLES.EXECUTOR);
+            return;
+        }
+        const isLegalSearch = sess.state === STATE.WAITING_LEGAL_BOOK_SEARCH;
+        // v4.54.0 (hardening): право на базу проверяем в МОМЕНТ ввода, а не только
+        // при клике по «🔍» — роль могли понизить между кликом и текстом.
+        if (!canSeeContacts(msg.from.id)) {
+            resetState(chatId);
+            return bot.sendMessage(chatId, '⛔ У вас нет прав на клиентскую базу.');
+        }
+        if (text.length < 2) {
+            return bot.sendMessage(chatId, '🔍 Слишком короткий запрос: минимум 2 символа. Напиши имя, телефон или e-mail.');
+        }
+        const empS = msg.from ? getEmployee(msg.from.id) : null;
+        const roleS = empS ? empS.Роль : ROLES.EXECUTOR;
+        await sendBookSearchResults(chatId, msg.from.id, roleS, text, isLegalSearch ? 'll' : 'cl');
+        return;
     }
 
     // ================== СОСТОЯНИЯ «СВОБОДНОГО ТЕКСТОВОГО ВВОДА» ==================
@@ -2478,7 +2635,10 @@ const { handleCallbackBlockA } = require('./handlers/main')({
         showProjectStep3, showContactSelectionForProject, showLegalSelectionForProject,
         showProjectAfterCreate, handleTaskDeadlineChosen, transferProject, createProjectRecord,
         sendTaskList, sendTodayTasks, sendTaskHistory, sendTaskDetails,
+        sendTaskListFromCtx, // v4.53.0: возврат в исходный список из карточки задачи
         sendContactsList, sendContactDetails, sendLegalList, sendLegalDetails,
+        // v4.54.0: поиск по справочникам (кнопка «🔍» в списке контактов/юрлиц)
+        showBookSearchPrompt, sendBookSearchResults,
         sendProjectsList, sendProjectDetails, sendProjectStatusMenu,
         sendProjectTasksList, sendProjectItemsList, sendProjectItemDetails,
         sendProjectDocsList, sendDocCard, sendDocCreateConfirm, generateDocPdfAndSend,
@@ -2490,6 +2650,50 @@ const { handleCallbackBlockA } = require('./handlers/main')({
     });
 
 
+
+// ================== КОНТЕКСТ ПОСЛЕДНЕГО СПИСКА ЗАДАЧ (v4.53.0) ==================
+// Changelog v4.36.0 обещал «закрытие/назад возвращает в тот список, откуда нажали»,
+// но view_back/done_ всегда звали sendTaskList → из «На сегодня» / «Истории» /
+// «Задач проекта» пользователь выпадал в «Все задачи». Теперь каждый рендер
+// списка задач запоминает свой контекст в сессии чата (sess.taskListCtx), а
+// возврат из карточки (view_back/done_) использует его. Кнопки из устаревших
+// сообщений (ctx нет / kind незнаком) ведут себя как раньше — фоллбэк «Все задачи».
+function setTaskListCtx(chatId, ctx) {
+    const s = getSession(sessions, chatId);
+    s.taskListCtx = ctx || null;
+}
+
+// v4.54.0: контекст справочника для возврата из карточки. Полный список кладёт
+// null (карточку покидаем → снова список), результаты поиска — { query } (из
+// карточки возвращаемся в ТЕ ЖЕ результаты). Читается в handlers/main.js
+// (ccard_back/lcard_back), пишется здесь в рендерах.
+function setContactBookCtx(chatId, ctx) {
+    const s = getSession(sessions, chatId);
+    s.contactBookCtx = ctx || null;
+}
+
+function setLegalBookCtx(chatId, ctx) {
+    const s = getSession(sessions, chatId);
+    s.legalBookCtx = ctx || null;
+}
+
+// Возврат в список, из которого была открыта карточка задачи.
+// Сигнатура повторяет sendTaskList: (chatId, messageId, telegramId, role).
+async function sendTaskListFromCtx(chatId, messageId, ctx, telegramId, role) {
+    const c = ctx || null;
+    if (!c) return sendTaskList(chatId, messageId, telegramId, role, 0);
+    switch (c.kind) {
+        case 'td': // «📅 На сегодня»
+            return sendTodayTasks(chatId, telegramId, role, messageId, c.page || 0);
+        case 'hl': // «📜 История»
+            return sendTaskHistory(chatId, telegramId, role, messageId, c.page || 0);
+        case 'pt': // «📋 Задачи проекта» (из карточки проекта)
+            if (!c.projectId) return sendTaskList(chatId, messageId, telegramId, role, 0);
+            return sendProjectTasksList(chatId, messageId, c.projectId, role, telegramId, c.page || 0);
+        default: // 'tl' и всё неизвестное — «Все задачи» (старое поведение)
+            return sendTaskList(chatId, messageId, telegramId, role, c.kind === 'tl' ? (c.page || 0) : 0);
+    }
+}
 
 // ================== ОБНОВЛЁННЫЙ СПИСОК ЗАДАЧ (с кнопкой ✏️) ==================
 async function sendTaskList(chatId, messageId, telegramId, role, page = 0) {
@@ -2507,6 +2711,7 @@ async function sendTaskList(chatId, messageId, telegramId, role, page = 0) {
     // 🆕 v4.22.0: UI-пагинация (лимит 100 кнопок / 4096 символов)
     const { pageItems, page: safePage, totalPages } = slicePage(activeTasks, page, LIST_PAGE_SIZE.tasks);
     setListPage(telegramId, 'tl', safePage);
+    setTaskListCtx(chatId, { kind: 'tl', page: safePage }); // v4.53.0: «вернись сюда» после карточки
 
         let text = `📋 *Активные задачи (${activeTasks.length})*${totalPages > 1 ? ` · стр. ${safePage + 1}/${totalPages}` : ''}`;
     // 🆕 v4.36.0: список = кнопки-пункты (как Проекты/Контакты). «✅ Закрыть» —
@@ -2534,9 +2739,11 @@ async function sendTaskList(chatId, messageId, telegramId, role, page = 0) {
 // ================== КАРТОЧКА ЗАДАЧИ (просмотр подробностей) ==================
 // Открывается кнопкой «👁 #id» из списков задач. Показывает название, срок, проект,
 // исполнителя и блок «📝 Подробности» (комментарии, файлы, пересланное из appendTaskDetails).
-async function sendTaskDetails(chatId, messageId, taskId, role) {
-    const res = await axios.get(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.TASKS}/${taskId}`, { headers: { 'xc-token': config.NOCO_TOKEN } });
-    const t = res.data;
+async function sendTaskDetails(chatId, messageId, taskId, role, task) {
+    // v4.53.0 (скорость): вызывающий (view_) уже сделал GET задачи для guard'а прав —
+    // передаём её сюда, чтобы НЕ ходить в NocoDB второй раз подряд на горячем пути.
+    // Опциональный параметр: task || GET (для внешних вызовов без предзагрузки).
+    const t = task || (await axios.get(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.TASKS}/${taskId}`, { headers: { 'xc-token': config.NOCO_TOKEN } })).data;
 
     let text = `📋 *Задача #${t.Id}:* ${escapeMarkdown(t['Что делаем?'] || 'Без названия')}\n\n`;
     text += `📅 *Срок:* ${t['Когда делаем'] ? formatMinskDate(t['Когда делаем']) : 'Без срока'}\n`;
@@ -2895,6 +3102,8 @@ async function sendContactsList(chatId, telegramId, role, messageId, page = 0) {
         // 🆕 v4.22.0: UI-пагинация
         const { pageItems, page: safePage, totalPages } = slicePage(contacts, page, LIST_PAGE_SIZE.simple);
         setListPage(telegramId, 'cl', safePage);
+        // v4.54.0: полный список = выход из поиска (карточка → «Назад» вернёт сюда, а не в результаты)
+        setContactBookCtx(chatId, null);
 
         let message = `📇 *Контакты (${contacts.length})*${totalPages > 1 ? ` · стр. ${safePage + 1}/${totalPages}` : ''}`;
         // 🆕 v4.35.0: список = кнопки-пункты. Полотно текста убрано: inline-кнопки в Telegram
@@ -2909,6 +3118,8 @@ async function sendContactsList(chatId, telegramId, role, messageId, page = 0) {
         }]);
         const nav = paginationRow('cl', safePage, totalPages);
         if (nav) inlineKeyboard.push(nav);
+        // v4.54.0: поиск по базе прямо из списка (без многостраничного листания)
+        inlineKeyboard.push([{ text: '🔍 Найти контакт', callback_data: 'cc_search' }]);
 
         const options = { parse_mode: 'Markdown' };
         if (inlineKeyboard.length > 0) options.reply_markup = { inline_keyboard: inlineKeyboard };
@@ -2922,6 +3133,104 @@ async function sendContactsList(chatId, telegramId, role, messageId, page = 0) {
             await bot.sendMessage(chatId, plainTextFromMarkdown(message), {});
         }
     } catch (err) { bot.sendMessage(chatId, `❌ Ошибка: ${err.message}`); }
+}
+
+// ================== ПОИСК ПО СПРАВОЧНИКАМ (v4.54.0) ==================
+// Кнопка «🔍 Найти контакт/юрлицо» в списке → подсказка ввода (state
+// WAITING_CONTACT_BOOK_SEARCH / WAITING_LEGAL_BOOK_SEARCH) → любой текст —
+// поисковый запрос → результат: inline-кнопки-карточки (до 15), «🔍 Уточнить
+// запрос», «⬅️ К списку». kind: 'cl' — контакты, 'll' — юрлица (ключи пагинации).
+// Данные — из кеша списков (TTL 15 c): повторный поиск/перерисовка результатов
+// НЕ ходит в NocoDB (один запрос на таблицу максимум раз в TTL).
+
+// Подсказка «напиши, кого найти». Рисуется на МЕСТЕ списка (editMessageText),
+// чтобы повторные «🔍 Уточнить запрос» не плодили кучу сообщений в чате.
+async function showBookSearchPrompt(chatId, messageId, kind) {
+    const isLegal = kind === 'll';
+    const sess = getSession(sessions, chatId);
+    sess.state = isLegal ? STATE.WAITING_LEGAL_BOOK_SEARCH : STATE.WAITING_CONTACT_BOOK_SEARCH;
+    const title = isLegal ? 'Поиск по юрлицам' : 'Поиск по контактам';
+    const fields = isLegal
+        ? 'название, УНП, телефон или e-mail'
+        : 'имя, телефон, @username или e-mail';
+    const text = `✏️ *${title}*\n\nНапиши: ${fields}. Покажу совпадения по всей базе.\n\n_Просто отправь текст в чат. Выход — «⬅️ Назад» в меню или /cancel._`;
+    const options = { parse_mode: 'Markdown' };
+    const sendNew = () => bot.sendMessage(chatId, text, options);
+    if (messageId) {
+        // Сообщение со списком могло устареть/удалиться — тогда отвечаем новым.
+        await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...options }).catch(sendNew);
+    } else {
+        await sendNew();
+    }
+}
+
+// Результаты поиска по справочнику. Вызывается:
+//   - из bot.on('text') после ввода запроса (messageId = null → новое сообщение),
+//   - из ccard_back/lcard_back при возврате из карточки (messageId = сообщение
+//     карточки → перерисовка результатов на её месте).
+async function sendBookSearchResults(chatId, telegramId, role, query, kind, messageId = null) {
+    try {
+        const isLegal = kind === 'll';
+        if (role === ROLES.EXECUTOR) {
+            return bot.sendMessage(chatId, isLegal
+                ? '🏢 *Юрлица:* У вас нет доступа к списку юрлиц.'
+                : '📇 *Контакты:* У вас нет доступа к списку контактов.', { parse_mode: 'Markdown' });
+        }
+
+        const pageKey = isLegal ? 'll' : 'cl';
+        const searchCb = isLegal ? 'll_search' : 'cc_search';
+        const cbPrefix = isLegal ? 'lcard_' : 'ccard_';
+        const rows = await noco.fetchAllRowsCached(
+            isLegal ? config.TABLES.LEGAL_ENTITIES : config.TABLES.CONTACTS,
+            { ttlMs: 15000 }
+        );
+        const found = (isLegal ? bookSearch.filterLegalsByQuery : bookSearch.filterContactsByQuery)(rows, query);
+
+        // Режим ожидания текста закончен. Повторный запрос — «🔍 Уточнить»,
+        // выход — «⬅️ К списку»; из карточки «Назад» возвращается сюда (ctx ниже).
+        const sess = getSession(sessions, chatId);
+        sess.state = STATE.IDLE;
+        if (isLegal) setLegalBookCtx(chatId, { query });
+        else setContactBookCtx(chatId, { query });
+
+        // Справочник — по алфавиту (ru), как в полном списке: результат стабилен
+        // между перерисовками (тот же порядок, что видит сотрудник в списке).
+        found.sort(isLegal ? sorters.compareLegalsByName : sorters.compareContactsByName);
+
+        const itemLabel = isLegal
+            ? (l) => `🏢 #${l.Id} ${cleanButtonText(l['Краткое Имя'] || l['Имя'] || 'Без имени')}${l['Телефон'] ? ` · ${cleanButtonText(l['Телефон'], 25)}` : ''}`
+            : (c) => `👤 #${c.Id} ${cleanButtonText(c['Имя'] || 'Без имени')}${c['Телефон'] ? ` · ${cleanButtonText(c['Телефон'], 25)}` : ''}`;
+        const foundWord = isLegal ? 'юрлиц' : 'контактов';
+        // «К списку» — на страницу, где сотрудник был до поиска (как в пагинации).
+        const backToListCb = `${pageKey}_${getListPage(telegramId, pageKey)}`;
+
+        let message;
+        const inlineKeyboard = [];
+        if (found.length === 0) {
+            message = `❌ Ничего не найдено по запросу "*${escapeMarkdown(query)}*".`;
+            inlineKeyboard.push([{ text: '🔍 Попробовать другой запрос', callback_data: searchCb }]);
+            inlineKeyboard.push([{ text: '⬅️ К списку', callback_data: backToListCb }]);
+        } else {
+            message = `🔍 *Найдено ${foundWord}: ${found.length}* по запросу "*${escapeMarkdown(query)}*"\n`;
+            if (found.length > 15) message += '_Показаны первые 15 — уточни запрос_\n';
+            message += '\n👇 *Нажми на запись* — откроется карточка с реквизитами.\n';
+            found.slice(0, 15).forEach(item => inlineKeyboard.push([{ text: itemLabel(item), callback_data: `${cbPrefix}${item.Id}` }]));
+            inlineKeyboard.push([{ text: '🔍 Уточнить запрос...', callback_data: searchCb }]);
+            inlineKeyboard.push([{ text: '⬅️ К списку', callback_data: backToListCb }]);
+        }
+
+        const options = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inlineKeyboard } };
+        try {
+            if (messageId) await bot.editMessageText(message, { chat_id: chatId, message_id: messageId, ...options });
+            else await bot.sendMessage(chatId, message, options);
+        } catch (e) {
+            console.error(`❌ Отправка результатов поиска ${kind}:`, e.message);
+            // 🐛 v4.21.2: не глотаем 400 молча — fallback plain text
+            await bot.sendMessage(chatId, plainTextFromMarkdown(message), { reply_markup: options.reply_markup });
+        }
+    } catch (err) {
+        bot.sendMessage(chatId, `❌ Ошибка поиска: ${err.message}`);
+    }
 }
 
 // ================== ФУНКЦИЯ: СПИСОК ПРОЕКТОВ ==================
@@ -3004,7 +3313,7 @@ async function sendProjectsList(chatId, telegramId, role, messageId, page = 0) {
 // ================== КАРТОЧКА КОНТАКТА (просмотр доп. информации) ==================
 // Открывается кнопкой «👁 #id» из списка контактов. Показывает реквизиты контакта
 // и блок «📝 Доп. информация» (пересланное, история из forward-флоу).
-async function sendContactDetails(chatId, messageId, contactId, role, telegramId) {
+async function sendContactDetails(chatId, messageId, contactId, role, telegramId, backTo = 'ccard_back') {
     const res = await axios.get(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.CONTACTS}/${contactId}`, { headers: { 'xc-token': config.NOCO_TOKEN } });
     const c = res.data;
 
@@ -3049,7 +3358,10 @@ async function sendContactDetails(chatId, messageId, contactId, role, telegramId
     } else {
         kb.push([{ text: '🏢 Привязать юрлицо', callback_data: `cc_link_${c.Id}` }]);
     }
-    kb.push([{ text: '⬅️ Назад', callback_data: 'ccard_back' }]);
+    // v4.55.0: карточку могли открыть из карточки проекта («🏢/👤 Открыть клиента»)
+    // — тогда backTo = `pcard_{id}` и «Назад» возвращает в проект, а не в список.
+    const isFromProject = typeof backTo === 'string' && backTo.startsWith('pcard_');
+    kb.push([{ text: isFromProject ? '⬅️ К проекту' : '⬅️ Назад', callback_data: backTo || 'ccard_back' }]);
 
     const options = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } };
     if (messageId) await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...options });
@@ -3082,6 +3394,8 @@ async function sendLegalList(chatId, telegramId, role, messageId, page = 0) {
         // 🆕 v4.22.0: UI-пагинация
         const { pageItems, page: safePage, totalPages } = slicePage(legals, page, LIST_PAGE_SIZE.simple);
         setListPage(telegramId, 'll', safePage);
+        // v4.54.0: полный список = выход из поиска (карточка → «Назад» вернёт сюда)
+        setLegalBookCtx(chatId, null);
 
         let message = `🏢 *Юрлица (${legals.length})*${totalPages > 1 ? ` · стр. ${safePage + 1}/${totalPages}` : ''}`;
         // 🆕 v4.35.0: список = кнопки-пункты. Полотно текста убрано: inline-кнопки в Telegram
@@ -3096,6 +3410,8 @@ async function sendLegalList(chatId, telegramId, role, messageId, page = 0) {
         }]);
         const nav = paginationRow('ll', safePage, totalPages);
         if (nav) inlineKeyboard.push(nav);
+        // v4.54.0: поиск по базе прямо из списка (без многостраничного листания)
+        inlineKeyboard.push([{ text: '🔍 Найти юрлицо', callback_data: 'll_search' }]);
 
         const options = { parse_mode: 'Markdown' };
         if (inlineKeyboard.length > 0) options.reply_markup = { inline_keyboard: inlineKeyboard };
@@ -3113,7 +3429,7 @@ async function sendLegalList(chatId, telegramId, role, messageId, page = 0) {
 
 // ================== КАРТОЧКА ЮРЛИЦА (просмотр реквизитов) ==================
 // Открывается кнопкой «👁 #id» из списка юрлиц. Показывает полные реквизиты юрлица.
-async function sendLegalDetails(chatId, messageId, legalId, role, telegramId) {
+async function sendLegalDetails(chatId, messageId, legalId, role, telegramId, backTo = 'lcard_back') {
     const res = await axios.get(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.LEGAL_ENTITIES}/${legalId}`, { headers: { 'xc-token': config.NOCO_TOKEN } });
     const l = res.data;
 
@@ -3137,9 +3453,11 @@ async function sendLegalDetails(chatId, messageId, legalId, role, telegramId) {
     }
 
     // 🆕 v4.43.0: правка реквизитов прямо из карточки (без похода в NocoDB).
+    // v4.55.0: из карточки проекта — «Назад» ведёт обратно в проект (как у контакта).
+    const isFromProject = typeof backTo === 'string' && backTo.startsWith('pcard_');
     const kb = [
         [{ text: '✏️ Изменить', callback_data: `lc_edit_${l.Id}` }],
-        [{ text: '⬅️ Назад', callback_data: 'lcard_back' }]
+        [{ text: isFromProject ? '⬅️ К проекту' : '⬅️ Назад', callback_data: backTo || 'lcard_back' }]
     ];
     const options = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } };
     if (messageId) await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...options });
@@ -3401,10 +3719,8 @@ async function sendOrgSelectionForContact(chatId, contactId) {
 async function showFoundLegalsForOrg(chatId, contactId, query) {
     try {
         const allLegals = await fetchAllRows(config.TABLES.LEGAL_ENTITIES);
-        const q = normalizeSearch(query);
-        const found = allLegals.filter(l => {
-            return [l['Краткое Имя'], l['Имя'], l['Телефон'], l['E-mail'], l['УНП'], l['Адрес']].some(f => normalizeSearch(f).includes(q));
-        });
+        // v4.54.0: единый предикат поиска (shared/search.js)
+        const found = bookSearch.filterLegalsByQuery(allLegals, query);
         if (found.length === 0) {
             const kb = [
                 [{ text: '🔍 Уточнить запрос', callback_data: `org_search_${contactId}` }],
@@ -3643,6 +3959,18 @@ async function sendProjectDetails(chatId, messageId, projectId, role, telegramId
     if (role === ROLES.ADMIN || role === ROLES.MANAGER) {
         // v4.42.4: внесение оплат — «выстрел наружу», только с флагом canSendDocuments
         const canPayDocs = roles.canSendDocuments(getEmployee(telegramId));
+
+        // 🆕 v4.55.0: открыть карточку клиента прямо из проекта — «кому звонить»,
+        // реквизиты, e-mail. M2O-поле проекта отдаёт только {Id, имя} (телефона нет),
+        // поэтому телефон/почта видны в полной карточке клиента (один GET).
+        // Хвостовой projectId в callback_data → «⬅️ К проекту» вернёт обратно.
+        const legalId = extractLinkId(p['Юрлицо']);
+        const contactId = extractLinkId(p['Контакт']);
+        const clientButtons = [];
+        if (legalId) clientButtons.push({ text: '🏢 Открыть юрлицо', callback_data: `lcard_${legalId}_${p.Id}` });
+        if (contactId) clientButtons.push({ text: '👤 Открыть контакт', callback_data: `ccard_${contactId}_${p.Id}` });
+        if (clientButtons.length > 0) inlineKeyboard.push(clientButtons);
+
         const actions = [
             { text: '📊 Изменить статус', callback_data: `pst_${projectId}` },
             { text: '📅 Срок', callback_data: `pdeadline_${projectId}` },
@@ -4085,6 +4413,7 @@ async function sendProjectTasksList(chatId, messageId, projectId, role, telegram
         // 🆕 v4.22.0: UI-пагинация (задачи проекта могут превысить лимит кнопок)
         const { pageItems, page: safePage, totalPages } = slicePage(projTasks, page, LIST_PAGE_SIZE.tasks);
         setListPage(telegramId, `ptasks:${projectId}`, safePage);
+        setTaskListCtx(chatId, { kind: 'pt', projectId, page: safePage }); // v4.53.0: «вернись сюда» после карточки
 
             let text = `📋 *Задачи проекта #${projectId}* (${projTasks.length})${totalPages > 1 ? ` · стр. ${safePage + 1}/${totalPages}` : ''}`;
     // 🆕 v4.36.0: список = кнопки-пункты; «✅ Закрыть» у «горящих» задач по правам
@@ -4821,7 +5150,11 @@ cron.schedule(config.CRON_TIME, async () => {
         // v4.27.0 (Проблема 92): рассылка идёт Руководителю из кэша, а не config.MY_ID (NaN).
         const digestRecipient = getAdminTgId();
         if (!digestRecipient) throw new Error('нет Telegram ID Руководителя в кэше');
-        bot.sendMessage(digestRecipient, message, { parse_mode: 'Markdown' });
+        // v4.49.0 (Волна 1): сводка не должна теряться, если сервер был офлайн
+        // ровно в момент рассылки — не ушла сразу → outbox доставит после связи.
+        const digestKey = `digest_${new Date().toISOString().slice(0, 10)}_${Date.now()}`;
+        const digestRes = await sendReliable(digestKey, digestRecipient, message);
+        console.log(`🌅 Утренняя рассылка: ${digestRes}`);
     } catch (err) { console.error('❌ Ошибка рассылки:', err.message); }
 });
 
@@ -4875,11 +5208,14 @@ cron.schedule(config.REMINDER_CRON || '*/5 * * * *', async () => {
             if (diffHours > 0.85 && diffHours < 1.15) {
                 const key = `${taskKey}_1h`;
                 if (!notifiedDeadlines.has(key)) {
-                    notifiedDeadlines.add(key);
-                    console.log(`⏰ [1h] задача #${task.Id} → tg ${tgId}`);
-                    bot.sendMessage(Number(tgId),
+                    // v4.49.0 (Волна 1): ключ «выдаётся» только при реальной доставке.
+                    // Не ушло сразу (офлайн) → запись в outbox; flush отметит после связи.
+                    const res = await sendReliable(key, Number(tgId),
                         `⏰ *Через 1 час дедлайн!*\n\n🔹 *#${task.Id}* ${escapeMarkdown(task['Что делаем?'])}\n📅 ${formatMinskDate(task['Когда делаем'])}`,
-                        { parse_mode: 'Markdown' }).catch(() => {});
+                        { journal: 'deadlines', replyMarkup: taskOpenKeyboard(task.Id) }
+                    );
+                    if (res === 'sent') notifiedDeadlines.add(key);
+                    console.log(`⏰ [1h] задача #${task.Id} → tg ${tgId} (${res})`);
                 }
             }
 
@@ -4887,11 +5223,12 @@ cron.schedule(config.REMINDER_CRON || '*/5 * * * *', async () => {
             if (diffMs <= 0 && diffMs > -60 * 60 * 1000) {
                 const key = `${taskKey}_due`;
                 if (!notifiedDeadlines.has(key)) {
-                    notifiedDeadlines.add(key);
-                    console.log(`⏰ [due] задача #${task.Id} → tg ${tgId}`);
-                    bot.sendMessage(Number(tgId),
+                    const res = await sendReliable(key, Number(tgId),
                         `⏰ *Пора выполнять задачу!*\n\n🔹 *#${task.Id}* ${escapeMarkdown(task['Что делаем?'])}\n📅 ${formatMinskDate(task['Когда делаем'])}`,
-                        { parse_mode: 'Markdown' }).catch(() => {});
+                        { journal: 'deadlines', replyMarkup: taskOpenKeyboard(task.Id) }
+                    );
+                    if (res === 'sent') notifiedDeadlines.add(key);
+                    console.log(`⏰ [due] задача #${task.Id} → tg ${tgId} (${res})`);
                 }
 
                 // 🆕 v4.21.4: алерт менеджеру проекта о просрочке (только _due, без _1h).
@@ -4903,11 +5240,12 @@ cron.schedule(config.REMINDER_CRON || '*/5 * * * *', async () => {
                     if (mgrTgId && mgrTgId !== tgId) {
                         const mgrKey = `${task.Id}_${mgrTgId}_due`;
                         if (!notifiedDeadlines.has(mgrKey)) {
-                            notifiedDeadlines.add(mgrKey);
-                            console.log(`⏰ [due:mgr] задача #${task.Id} → tg ${mgrTgId}`);
-                            bot.sendMessage(Number(mgrTgId),
+                            const resMgr = await sendReliable(mgrKey, Number(mgrTgId),
                                 `⏰ *Просрочена задача в твоём проекте!*\n\n🔹 *#${task.Id}* ${escapeMarkdown(task['Что делаем?'])}\n📁 ${escapeMarkdown(task['Какой проект']?.['Что делаем?'] || 'Проект')}\n📅 Дедлайн был: ${formatMinskDate(task['Когда делаем'])}\n${task['Исполнитель'] ? `👤 Исполнитель: ${escapeMarkdown(task['Исполнитель']['ФИО'] || 'Сотрудник')}` : ''}`,
-                                { parse_mode: 'Markdown' }).catch(() => {});
+                                { journal: 'deadlines', replyMarkup: taskOpenKeyboard(task.Id) }
+                            );
+                            if (resMgr === 'sent') notifiedDeadlines.add(mgrKey);
+                            console.log(`⏰ [due:mgr] задача #${task.Id} → tg ${mgrTgId} (${resMgr})`);
                         }
                     }
                 }
@@ -4922,11 +5260,12 @@ cron.schedule(config.REMINDER_CRON || '*/5 * * * *', async () => {
                 if (adminTgId) {
                     const lateKey = `${task.Id}_${adminTgId}_late2h`;
                     if (!notifiedDeadlines.has(lateKey)) {
-                        notifiedDeadlines.add(lateKey);
-                        console.log(`⏰ [late2h] задача #${task.Id} → tg ${adminTgId}`);
-                        bot.sendMessage(Number(adminTgId),
+                        const resLate = await sendReliable(lateKey, Number(adminTgId),
                             `⏰ *Задача просрочена уже 2+ часа!*\n\n🔹 *#${task.Id}* ${escapeMarkdown(task['Что делаем?'])}\n📅 Дедлайн был: ${formatMinskDate(task['Когда делаем'])}\n${task['Какой проект'] ? `📁 ${escapeMarkdown(task['Какой проект']?.['Что делаем?'] || 'Проект')}\n` : ''}${task['Исполнитель'] ? `👤 Исполнитель: ${escapeMarkdown(task['Исполнитель']['ФИО'] || 'Сотрудник')}` : '👤 Без исполнителя'}`,
-                            { parse_mode: 'Markdown' }).catch(() => {});
+                            { journal: 'deadlines', replyMarkup: taskOpenKeyboard(task.Id) }
+                        );
+                        if (resLate === 'sent') notifiedDeadlines.add(lateKey);
+                        console.log(`⏰ [late2h] задача #${task.Id} → tg ${adminTgId} (${resLate})`);
                     }
                 }
             }
@@ -4952,5 +5291,42 @@ setInterval(() => {
         console.log(`🧹 Очистка сессий: залипших сброшено=${staleCleaned}, пустых удалено=${idleRemoved}, всего=${sessions.size}`);
     }
 }, 60 * 60 * 1000); // раз в час
+
+// ================== STARTUP-BEACON (v4.49.0, Волна 1 безотказности) ==================
+// «Свет дали / сервер поднялся / бот перезапущен»: после старта Руководителю
+// уходит короткое служебное сообщение. Если Telegram недоступен — sendReliable
+// кладёт beacon в outbox-очередь, и он доедет сразу после восстановления связи.
+// Анти-спам: beacon шлётся не чаще раза в BEACON_MIN_INTERVAL_MS — защита от
+// watchdog-рестартов и upgrade-циклов, когда бот перезапускается пачками.
+const BEACON_FILE = '/mnt/data/logs/last-bot-start';
+const BEACON_MIN_INTERVAL_MS = 20 * 60 * 1000;
+
+function sendStartupBeacon() {
+    const fs = require('fs');
+    let lastStart = 0;
+    try { lastStart = parseInt(fs.readFileSync(BEACON_FILE, 'utf8'), 10) || 0; } catch (e) { /* первый запуск */ }
+    const now = Date.now();
+    try {
+        fs.mkdirSync('/mnt/data/logs', { recursive: true });
+        fs.writeFileSync(BEACON_FILE, String(now), 'utf8');
+    } catch (e) { /* не критично — beacon без истории всё равно уйдёт */ }
+
+    const adminId = getAdminTgId();
+    if (!adminId) {
+        console.log('🔇 Beacon: Руководитель ещё не в кэше — пропускаю');
+        return;
+    }
+    if (now - lastStart < BEACON_MIN_INTERVAL_MS) {
+        console.log('🔇 Beacon: частый рестарт бота — не спамлю');
+        return;
+    }
+    const ts = new Date().toLocaleString('ru-RU', { timeZone: config.TZ });
+    sendReliable(`beacon_${now}`, adminId, `🟢 *CRM поднялась*\n\n⏰ ${ts}`)
+        .then(r => console.log(`🟢 Beacon: ${r}`))
+        .catch(e => console.error(`🔴 Beacon: ошибка: ${e.message}`));
+}
+
+// Beacon запускаем после первой загрузки кэша сотрудников (адресат известен).
+setTimeout(sendStartupBeacon, 20 * 1000);
 
 console.log('🤖 Бот запущен и готов к работе! 🚀');

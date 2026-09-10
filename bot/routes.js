@@ -50,6 +50,8 @@ const BLOCK_A = {
         'use_existing_contact', 'create_new_anyway', 'create_new_anyway_username',
         'proj_tab_fiz', 'proj_tab_legal', 'proj_search_contact', 'proj_search_legal',
         'proj_search_all', 'proj_new_contact', 'proj_new_legal', 'proj_no_contact',
+        // v4.54.0: поиск по справочникам — кнопка «🔍 Найти контакт/юрлицо» в списке
+        'cc_search', 'll_search',
         'proj_task_yes', 'proj_task_no', 'pdone_dismiss', 'dup_use_existing',
         'dup_create_anyway', 'view_back', 'ccard_back', 'lcard_back', 'pcard_back',
         'arch_back', 'refresh_tasks', 'noop', 'start_new_task', 'task_exec_none',
@@ -139,7 +141,10 @@ const MANAGER_ONLY_PREFIXES = [
     // v4.43.0: правка контактов/юрлиц и привязка контакта к юрлицу — то же право,
     // что на просмотр клиентской базы (Менеджер+; «видишь — с тем и работаешь»)
     'cc_edit_', 'cc_field_', 'ccmsg_', 'cc_link_', 'cc_unlink_',
-    'org_pick_', 'org_search_', 'org_cancel_', 'lc_edit_', 'lc_field_'
+    'org_pick_', 'org_search_', 'org_cancel_', 'lc_edit_', 'lc_field_',
+    // v4.54.0: поиск по справочникам (кнопки «🔍» в списках контактов/юрлиц).
+    // Точные колбэки, но guard'ятся как префиксы (startsWith) — значения без «_».
+    'cc_search', 'll_search'
 ];
 
 function isAdminOnlyCallback(data) {

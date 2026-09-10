@@ -36,7 +36,9 @@ test('Каждый точный колбэк блока B классифицир
 
 test('Префиксные колбэки с реальными суффиксами — в свои блоки', () => {
     const samples = {
-        A: ['done_123', 'pcard_42', 'ccard_7', 'lcard_3', 'proj_contact_11',
+        A: ['done_123', 'pcard_42', 'ccard_7', 'lcard_3',
+            // v4.55.0: карточки клиента с «возвратом в проект» (хвостовой projectId)
+            'ccard_7_42', 'lcard_3_42', 'proj_contact_11',
             'dl_2h', 'messenger_skip', 'task_exec_99', 'project_12',
             'pst_set_5_2', 'pst_5_1', 'append_to_proj_8', 'pnewtask_6',
             'pattach_6', 'assign_exec_1_2', 'pick_exec_1_2', 'keep_common_5',
@@ -148,6 +150,8 @@ test('Задачи/папки/файлы/контакты проекта — к�
         // v4.43.0: правка карточки контакта/юрлица + привязка контакта к юрлицу
         'cc_edit_5', 'cc_field_5_name', 'ccmsg_5_Telegram', 'cc_link_5', 'cc_unlink_5',
         'org_pick_5_3', 'org_search_5', 'org_cancel_5', 'lc_edit_3', 'lc_field_3_unp',
+        // v4.54.0: поиск по справочникам — кнопки «🔍» в списках контактов/юрлиц
+        'cc_search', 'll_search',
         'hidden_create_new', 'hidden_add_to_contact', 'hidden_cancel',
         'hidden_select_contact_1', 'hidden_select_project_2',
         'forward_create_new', 'forward_add_to_contact', 'forward_show_all_contacts',
