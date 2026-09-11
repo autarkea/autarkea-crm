@@ -74,23 +74,44 @@ fi
 echo ""
 
 # ============================================================================
-# ШАГ 0: Проверка свободного места
-# (найдено 11.09.2026 на VM: LV 11.5 ГБ → 98%, NocoDB не стартовал, установка
-#  сорвалась. Образы Docker ~4 ГБ + build-cache + данные требуют места.)
+# ШАГ 0: Проверка свободного места + авто-расширение LVM при необходимости
+# (11.09.2026: Ubuntu guided-LVM ставит корень лишь на ЧАСТЬ диска — LV 11.5 из
+#  23 ГБ, а ещё 11.5 ГБ пустуют в volume group → диск забивается, NocoDB не
+#  стартует, установка падает. Теперь: места мало, но VG не пуст → предлагаем
+#  расширить корень на месте.)
 # ============================================================================
 echo -e "${BLUE}💾 Шаг 0: Проверка свободного места...${NC}"
 DATA_FS="/mnt/data"
 [ -d "$DATA_FS" ] || DATA_FS="/"
-FREE_KB=$(df -Pk "$DATA_FS" | awk 'NR==2 {print $4}')
-FREE_GB=$(( FREE_KB / 1024 / 1024 ))
+
+free_gb() { df -Pk "$1" | awk 'NR==2 {print int($4/1024/1024)}'; }
+FREE_GB=$(free_gb "$DATA_FS")
+
+# Авто-расширение: места < 15 ГБ И в LVM пустует > 5 ГБ → предложить lvextend+resize2fs
+if [ "$FREE_GB" -lt 15 ] && command -v vgs &>/dev/null && command -v lvextend &>/dev/null; then
+    ROOT_SRC=$(df -Pk "$DATA_FS" | awk 'NR==2 {print $1}')
+    VG_FREE_M=$(sudo vgs --noheadings --units m -o vg_free | head -1 | tr -d ' m' | cut -d. -f1)
+    if [ -n "${VG_FREE_M:-}" ] && [ "${VG_FREE_M:-0}" -gt 5000 ] && [[ "$ROOT_SRC" == /dev/mapper/* ]]; then
+        echo -e "${YELLOW}⚠️  Свободно ${FREE_GB} ГБ, но в LVM пустует $(( VG_FREE_M / 1024 )) ГБ.${NC}"
+        echo -e "${YELLOW}   Ubuntu часто ставит корень лишь на часть диска. Расширить сейчас?${NC}"
+        echo -e "${CYAN}   sudo lvextend -l +100%FREE $ROOT_SRC && sudo resize2fs $ROOT_SRC${NC}"
+        read -p "   Расширить корневой раздел на всё свободное место? (y/N): " lvm_go
+        if [[ "$lvm_go" == "y" || "$lvm_go" == "Y" ]]; then
+            if sudo lvextend -l +100%FREE "$ROOT_SRC" && sudo resize2fs "$ROOT_SRC"; then
+                FREE_GB=$(free_gb "$DATA_FS")
+                echo -e "${GREEN}✅ Раздел расширен — теперь свободно ${FREE_GB} ГБ${NC}"
+            else
+                echo -e "${YELLOW}⚠️  Авто-расширение не удалось. Сделай вручную (команда выше).${NC}"
+            fi
+        fi
+    fi
+fi
+
 if [ "$FREE_GB" -lt 10 ]; then
     echo -e "${RED}❌ Мало свободного места на $DATA_FS: ${FREE_GB} ГБ.${NC}"
     echo -e "${YELLOW}   Нужно ~15+ ГБ (образы Docker ~4 ГБ + данные + бэкапы), иначе NocoDB${NC}"
     echo -e "${YELLOW}   не стартует и установка прервётся.${NC}"
-    echo -e "${YELLOW}   Обычно на LVM есть незанятое место в volume group:${NC}"
-    echo -e "${CYAN}   sudo vgs${NC}"
-    echo -e "${CYAN}   sudo lvextend -l +100%FREE /dev/<vg>/<lv> && sudo resize2fs /dev/<vg>/<lv>${NC}"
-    echo -e "${CYAN}   (или освободить: docker system prune -a -f)${NC}"
+    echo -e "${CYAN}   Варианты: увеличить диск/раздел; освободить: docker system prune -a -f${NC}"
     read -p "   Продолжить всё равно? (y/N): " disk_go
     [ "$disk_go" = "y" ] || [ "$disk_go" = "Y" ] || exit 1
 elif [ "$FREE_GB" -lt 15 ]; then
