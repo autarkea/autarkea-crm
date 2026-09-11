@@ -531,6 +531,30 @@ else
     echo -e "${YELLOW}⚠️  setup-bot.sh не найден${NC}"
 fi
 
+# v4.56.2: КОНТРОЛЬ, что setup-bot.sh реально заполнил TABLE_*.
+# Найдено на VM 192.168.2.234: Шаг 8 не заполнил переменные, но установка
+# «успешно» завершилась → бот молча не работает (нет ID таблиц).
+TABLE_COUNT=$(grep -c '^TABLE_' .env 2>/dev/null || true)
+TABLE_COUNT=${TABLE_COUNT:-0}
+if [ "$TABLE_COUNT" -eq 0 ]; then
+    echo -e "${YELLOW}⚠️  TABLE_* пусты — повторяю setup-bot.sh через 3с...${NC}"
+    sleep 3
+    bash setup-bot.sh --no-restart || true
+    TABLE_COUNT=$(grep -c '^TABLE_' .env 2>/dev/null || true)
+    TABLE_COUNT=${TABLE_COUNT:-0}
+fi
+if [ "$TABLE_COUNT" -eq 0 ]; then
+    echo -e "${RED}❌ TABLE_* не заполнены — бот НЕ сможет работать без ID таблиц.${NC}"
+    echo -e "${YELLOW}   Проверь: NocoDB жив (curl localhost:8081), BASE_ID/NOCO_TOKEN в .env.${NC}"
+    echo -e "${CYAN}   Затем вручную: bash setup-bot.sh${NC}"
+    read -p "   Прервать установку? (y/N): " abort_no_tables
+    if [[ "$abort_no_tables" == "y" || "$abort_no_tables" == "Y" ]]; then
+        exit 1
+    fi
+else
+    echo -e "${GREEN}✅ TABLE_* заполнены ($TABLE_COUNT шт.)${NC}"
+fi
+
 echo ""
 echo -e "${MAGENTA}═══════════════════════════════════════════════════════════${NC}"
 echo -e "${MAGENTA}🌐 Как планируешь получать доступ к CRM?${NC}"
