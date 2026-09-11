@@ -3,9 +3,17 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const multer = require('multer');
 const { execFileSync } = require('child_process');
+const {
+    sanitizeFolderName,
+    sanitizeFileName,
+    formatContactName,
+    getLinkedId,
+    listFiles,
+    generateClientId,
+    findExistingProjectFolder
+} = require('./shared/webhook-utils');
 
 const app = express();
 app.use(express.json());
@@ -56,99 +64,9 @@ const PDF_DIR = '/mnt/data/noco-static/pdfs';
 const NOCO_TIMEOUT = 10000; // ⏱️ Проблема 90: таймаут запросов webhook→NocoDB. Без него зависшая NocoDB вешает /upload-file → бот получает «timeout of 30000ms exceeded»
 
 // ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
-
-// 🆕 УМНАЯ ОЧИСТКА ИМЕН ДЛЯ ФАЙЛОВОЙ СИСТЕМЫ (защита от ENAMETOOLONG)
-function sanitizeFolderName(name, maxLength = 50) {
-    if (!name) return 'Без названия';
-    
-    // 1. Заменяем переносы строк на пробелы
-    let clean = String(name).replace(/[\r\n]+/g, ' ');
-    
-    // 2. Удаляем опасные символы для файловой системы
-    clean = clean.replace(/[\/\\:*?<>|@"']/g, '');
-    
-    // 3. Убираем лишние пробелы
-    clean = clean.replace(/\s+/g, ' ').trim();
-    
-    // 4. Обрезаем до безопасной длины (с учетом многоточия)
-    if (clean.length > maxLength) {
-        clean = clean.substring(0, maxLength - 3).trim() + '...';
-    }
-    
-    // 5. Финальная проверка (если после очистки строка пустая)
-    if (!clean || clean === '...') {
-        clean = 'Без названия';
-    }
-    
-    return clean;
-}
-
-function generateClientId() {
-    const letters = Array.from({ length: 3 }, () => String.fromCharCode(65 + crypto.randomInt(26))).join('');
-    const digits = crypto.randomInt(1000).toString().padStart(3, '0');
-    return `${letters}${digits}`;
-}
-
-function formatContactName(name) {
-    if (!name) return '';
-    return name.replace(/@(\w+)/g, '($1)');
-}
-
-function listFiles(dir, prefix = '') {
-    let result = '';
-    try {
-        const items = fs.readdirSync(dir, { withFileTypes: true });
-        for (const item of items) {
-            if (item.name.startsWith('.')) continue;
-            result += `${prefix}- ${item.name}${item.isDirectory() ? '/' : ''}\n`;
-            if (item.isDirectory()) {
-                result += listFiles(path.join(dir, item.name), prefix + '  ');
-            }
-        }
-    } catch (e) {
-        result += `${prefix}[Ошибка чтения]\n`;
-    }
-    return result;
-}
-
-function getLinkedId(fieldData) {
-    if (!fieldData) return null;
-    if (Array.isArray(fieldData) && fieldData.length > 0) return fieldData[0]?.Id || null;
-    if (typeof fieldData === 'object' && fieldData !== null) return fieldData.Id || null;
-    if (typeof fieldData === 'string' || typeof fieldData === 'number') return fieldData;
-    return null;
-}
-
-// 🆕 УМНЫЙ ПОИСК СУЩЕСТВУЮЩЕЙ ПАПКИ (Защита от коллизий ID)
-function findExistingProjectFolder(projectId, expectedProjName, expectedClientName) {
-    if (!fs.existsSync(PROJECTS_ROOT)) return null;
-    
-    const folders = fs.readdirSync(PROJECTS_ROOT);
-    // 🔍 Ищем папку с ID в начале имени, допуская разные разделители:
-    // "123 - Имя", "123-Имя", "123_Имя" — чтобы распознать папку даже после ручного переименования
-    // (раньше жёсткий префикс "123 - " пропускал переименованную вручную папку → дубликат)
-    const idPattern = new RegExp(`^${projectId}[ -_]`);
-    const matchingFolders = folders.filter(f => idPattern.test(f));
-    
-    if (matchingFolders.length === 0) return null;
-    
-    if (matchingFolders.length === 1) {
-        const folder = matchingFolders[0];
-        // Проверяем, не изменилось ли имя клиента в названии папки
-        const parts = folder.split(' - ');
-        const folderClientName = parts.length > 2 ? parts[parts.length - 1] : '';
-        
-        if (folderClientName && folderClientName !== expectedClientName) {
-            console.log(`⚠️ ВНИМАНИЕ: Клиент в NocoDB изменён! В папке: "${folderClientName}", в NocoDB: "${expectedClientName}"`);
-            console.log(`💡 Используем существующую папку, чтобы не сломать файлы. Переименуйте вручную при необходимости.`);
-        }
-        return path.join(PROJECTS_ROOT, folder);
-    }
-    
-    // Если найдено несколько папок с одним ID (аномалия)
-    console.log(`❌ КРИТИЧЕСКАЯ ОШИБКА: Найдено ${matchingFolders.length} папок с ID=${projectId}!`);
-    return path.join(PROJECTS_ROOT, matchingFolders[0]); // Возвращаем первую как наименее разрушительный fallback
-}
+// Чистые помощники (sanitizeFolderName, sanitizeFileName, formatContactName,
+// getLinkedId, listFiles, generateClientId, findExistingProjectFolder) вынесены
+// в shared/webhook-utils.js (v4.56.0) — тесты: tests/webhook-utils.test.js.
 
 // Получаем данные проекта и формируем путь к папке
 async function getProjectFolderPath(projectId) {
@@ -235,7 +153,7 @@ async function getProjectFolderPath(projectId) {
     const expectedFolderName = `${projectId} - ${safeProjName} - ${safeClientName}`;
 
     // 6. 🛡️ ПРОВЕРКА НА СУЩЕСТВОВАНИЕ (Защита от дубликатов при смене клиента)
-    const existingPath = findExistingProjectFolder(projectId, safeProjName, safeClientName);
+    const existingPath = findExistingProjectFolder(PROJECTS_ROOT, projectId, safeProjName, safeClientName);
     
     if (existingPath) {
         console.log(`🔄 Найдена существующая папка: ${existingPath}`);
@@ -758,7 +676,7 @@ app.post('/upload-file', upload.single('file'), async (req, res) => {
         }
 
         // Санитайз имени файла
-        const safeName = file.originalname.replace(/[^a-zA-Z0-9а-яА-ЯёЁ._ -]/g, '_');
+        const safeName = sanitizeFileName(file.originalname);
 
         // ♻️ Идемпотентность (Проблема 91): при ретрае после частичного успеха
         // (файл записан, но ответ/последующий шаг упали) не создаём дубль — если файл

@@ -74,6 +74,33 @@ fi
 echo ""
 
 # ============================================================================
+# ШАГ 0: Проверка свободного места
+# (найдено 11.09.2026 на VM: LV 11.5 ГБ → 98%, NocoDB не стартовал, установка
+#  сорвалась. Образы Docker ~4 ГБ + build-cache + данные требуют места.)
+# ============================================================================
+echo -e "${BLUE}💾 Шаг 0: Проверка свободного места...${NC}"
+DATA_FS="/mnt/data"
+[ -d "$DATA_FS" ] || DATA_FS="/"
+FREE_KB=$(df -Pk "$DATA_FS" | awk 'NR==2 {print $4}')
+FREE_GB=$(( FREE_KB / 1024 / 1024 ))
+if [ "$FREE_GB" -lt 10 ]; then
+    echo -e "${RED}❌ Мало свободного места на $DATA_FS: ${FREE_GB} ГБ.${NC}"
+    echo -e "${YELLOW}   Нужно ~15+ ГБ (образы Docker ~4 ГБ + данные + бэкапы), иначе NocoDB${NC}"
+    echo -e "${YELLOW}   не стартует и установка прервётся.${NC}"
+    echo -e "${YELLOW}   Обычно на LVM есть незанятое место в volume group:${NC}"
+    echo -e "${CYAN}   sudo vgs${NC}"
+    echo -e "${CYAN}   sudo lvextend -l +100%FREE /dev/<vg>/<lv> && sudo resize2fs /dev/<vg>/<lv>${NC}"
+    echo -e "${CYAN}   (или освободить: docker system prune -a -f)${NC}"
+    read -p "   Продолжить всё равно? (y/N): " disk_go
+    [ "$disk_go" = "y" ] || [ "$disk_go" = "Y" ] || exit 1
+elif [ "$FREE_GB" -lt 15 ]; then
+    echo -e "${YELLOW}⚠️  Свободно ${FREE_GB} ГБ — впритык. Рекомендуем 15+ ГБ.${NC}"
+else
+    echo -e "${GREEN}✅ Свободно ${FREE_GB} ГБ на $DATA_FS${NC}"
+fi
+echo ""
+
+# ============================================================================
 # ШАГ 1: Проверка и установка Docker
 # ============================================================================
 echo -e "${BLUE}📦 Шаг 1/8: Проверка и установка Docker...${NC}"
@@ -318,7 +345,8 @@ docker compose up -d --build
 echo -e "${GREEN}✅ Контейнеры запущены${NC}"
 
 echo -e "${BLUE}⏳ Шаг 6/8: Ожидание запуска NocoDB...${NC}"
-MAX_ATTEMPTS=30
+# v4.56.0: 30×2с (≈60с) не хватало на медленных VM — NocoDB поднимается до ~4 мин.
+MAX_ATTEMPTS=90
 ATTEMPT=0
 while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
     RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8081" --connect-timeout 2 --max-time 5 2>/dev/null || echo "000")
@@ -330,8 +358,10 @@ while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
     sleep 2
 done
 if [[ "$RESPONSE" != "200" && "$RESPONSE" != "302" ]]; then
-    echo -e "${RED}❌ NocoDB не отвечает!${NC}"
-    echo -e "${YELLOW}💡 Проверь логи: docker logs printed4u-nocodb${NC}"
+    echo -e "${RED}❌ NocoDB не отвечает за ~3 минуты!${NC}"
+    echo -e "${YELLOW}💡 Последние логи NocoDB:${NC}"
+    docker logs --tail 30 nocodb 2>&1 | sed 's/^/   /' || true
+    echo -e "${YELLOW}   Частые причины: мало места на диске (df -h), не хватило RAM.${NC}"
     exit 1
 fi
 echo ""
@@ -350,10 +380,37 @@ echo -e "${YELLOW}════════════════════�
 read -p "Когда создашь базу и скопируешь токен, нажми Enter..."
 
 read -p "Вставь NocoDB API Token: " noco_token
-if [ -z "$noco_token" ]; then
-    echo -e "${RED}❌ Токен не может быть пустым!${NC}"
-    exit 1
-fi
+# v4.56.0: ПРОВЕРКА ТОКЕНА через API. Раньше неверный токен молча принимался,
+# установка «доходила» до конца с битым токеном → бот/webhook получали 401.
+while true; do
+    if [ -z "$noco_token" ]; then
+        echo -e "${RED}❌ Токен не может быть пустым!${NC}"
+        read -p "Вставь NocoDB API Token: " noco_token
+        continue
+    fi
+    TOKEN_CHECK=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "xc-token: $noco_token" "http://localhost:8081/api/v2/meta/bases" \
+        --connect-timeout 3 --max-time 8 2>/dev/null || echo "000")
+    # Резервный эндпоинт (на случай отличий между версиями NocoDB)
+    if [ "$TOKEN_CHECK" != "200" ]; then
+        TOKEN_CHECK=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "xc-token: $noco_token" "http://localhost:8081/api/v1/db/meta/projects/" \
+            --connect-timeout 3 --max-time 8 2>/dev/null || echo "000")
+    fi
+    if [ "$TOKEN_CHECK" = "200" ]; then
+        echo -e "${GREEN}✅ Токен действителен${NC}"
+        break
+    fi
+    echo -e "${RED}❌ Токен не принят NocoDB (HTTP $TOKEN_CHECK).${NC}"
+    echo -e "${YELLOW}   Создай токен: http://$ACCESS_IP:8081 → Account Settings → Tokens → Create${NC}"
+    echo -e "${YELLOW}   (убедись, что токен — от ЭТОЙ базы, а не от другого сервера)${NC}"
+    read -p "   Вставить другой токен? (y/N): " retry_token
+    if [[ "$retry_token" != "y" && "$retry_token" != "Y" ]]; then
+        echo -e "${YELLOW}   Прерываю. Запусти install.sh снова, когда будет корректный токен.${NC}"
+        exit 1
+    fi
+    read -p "Вставь NocoDB API Token: " noco_token
+done
 sed -i "s|NOCO_TOKEN=.*|NOCO_TOKEN=$noco_token|" .env
 sed -i "s|NOCO_URL=.*|NOCO_URL=http://nocodb:8080|" .env
 
