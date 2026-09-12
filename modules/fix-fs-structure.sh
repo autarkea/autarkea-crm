@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Printed4U CRM - Watchdog файловой системы (v1.0.0)
+# Printed4U CRM - Watchdog файловой системы (v1.1.0)
 # ============================================================================
 # Назначение: Самоисцеление структуры папок. Защита от "кривых рук".
 # Что делает (каждые 5 минут через cron):
@@ -10,6 +10,20 @@
 #   4. Восстанавливает права: каркас 0755, Рабочие 0775, Документы 0755
 #   5. Пересоздаёт битые symlink'и в папках клиентов
 #   6. Всё логирует в /mnt/data/logs/fs-fix.log
+# ============================================================================
+# 🆕 v1.1.0 (Проблема 128): WINDOWS-SAFE ИМЕНА.
+#   Windows (Explorer/Win32) не открывает папки/файлы, имя которых оканчивается
+#   точкой или пробелом (срезает хвост → путь не совпадает → «Отказано в доступе»).
+#   Клиентский кейс: контакт «Ярошеня С.Н.» → папка проекта с точкой на конце,
+#   файлы из Проводника в неё не клались.
+#   Что исправлено:
+#     - sanitize_name() синхронизирован с webhook (shared/webhook-utils.js →
+#       sanitizeFolderName): многоточие обрезки «…» (U+2026), хвост точек/пробелов
+#       срезается, пробелы триммятся. Раньше watchdog и webhook считали имена
+#       по-разному → папку переименовывали друг за другом (ping-pong);
+#     - для контакта применяется '@user' → '(user)' — как в webhook (formatContactName);
+#     - имена ссылок в папках клиентов тоже приводятся к Windows-safe виду.
+#   Миграция существующих папок = разовый запуск этого модуля (или cron сам за 5 мин).
 # ============================================================================
 # Использование:
 #   bash modules/fix-fs-structure.sh             # разовая проверка
@@ -100,23 +114,30 @@ get_project() {
         "$NOCO_URL/api/v1/db/data/noco/$BASE_ID/$TABLE_PROJECTS/$project_id" 2>/dev/null
 }
 
-# Санитайзер имён (синхронизирован с webhook/server.js)
+# Санитайзер имён (синхронизирован с webhook: shared/webhook-utils.js → sanitizeFolderName).
+# v1.1.0 (Проблема 128): Windows-safe — имя НЕ оканчивается точкой/пробелом;
+# многоточие обрезки «…» (U+2026), а не «...». Иначе watchdog и webhook считают
+# имена по-разному и переименовывают папку друг за другом (ping-pong).
 sanitize_name() {
     local name="$1"
     local max_len="$2"
     local clean
-    clean=$(echo "$name" | tr -d '\r\n' | tr -s ' ')
+    # Переносы строк/табы → пробел + сжатие пробелов (аналог JS: \s+ → ' ')
+    clean=$(printf '%s' "$name" | tr -s '[:space:]' ' ')
     # Удаляем опасные символы (\\ / : * ? < > | @ " '), но НЕ дефис и НЕ пробел
-    clean=$(echo "$clean" | sed 's/[\/\\:*?<>|@"'"'"']//g')
-    # Сжимаем пробелы
-    clean=$(echo "$clean" | tr -s ' ')
-    # Обрезаем до max_len
-    if [ ${#clean} -gt "$max_len" ]; then
-        clean="${clean:0:$((max_len-3))}"
-        clean="${clean% }..."
+    clean=$(printf '%s' "$clean" | sed 's/[\/\\:*?<>|@"'"'"']//g')
+    # Трим (аналог .trim() в JS)
+    clean=$(printf '%s' "$clean" | sed 's/^ *//; s/ *$//')
+    # Обрезка до max_len: тело без хвостовых пробелов + «…» (как chars.slice(0, max_len-1) + '…')
+    if [ "${#clean}" -gt "$max_len" ]; then
+        clean="${clean:0:$((max_len-1))}"
+        clean=$(printf '%s' "$clean" | sed 's/ *$//')
+        clean="${clean}…"
     fi
+    # 🪟 Windows-safe: имя не оканчивается точкой/пробелом
+    clean=$(printf '%s' "$clean" | sed 's/[. ]*$//')
     # Финальная проверка
-    if [ -z "$clean" ] || [ "$clean" = "..." ]; then
+    if [ -z "$clean" ] || [ "$clean" = "…" ]; then
         clean="Без названия"
     fi
     echo "$clean"
@@ -165,6 +186,10 @@ fix_projects() {
             c_json=$(curl -s --max-time 10 -H "xc-token: $NOCO_TOKEN" \
                 "$NOCO_URL/api/v1/db/data/noco/$BASE_ID/$TABLE_CONTACTS/$contact_id" 2>/dev/null)
             client_name=$(echo "$c_json" | jq -r '."Имя" // ""' 2>/dev/null)
+            # v1.1.0: как в webhook (formatContactName) — '@user' → '(user)'.
+            # Иначе webhook и watchdog считают имя клиента по-разному и
+            # переименовывают папку друг за другом каждые 5 минут.
+            client_name=$(printf '%s' "$client_name" | sed 's/@\([A-Za-z0-9_]*\)/(\1)/g')
         fi
         [ -z "$client_name" ] && client_name="Без клиента"
 
@@ -226,6 +251,23 @@ fix_clients() {
         for link in "$folder"*; do
             [ -L "$link" ] || continue
             link_name=$(basename "$link")
+
+            # 🪟 v1.1.0 (Проблема 128): имя ссылки не должно оканчиваться точкой/пробелом —
+            # Windows не откроет такой путь (клиентский кейс: «14 - ...по 20 мм...»).
+            safe_link_name=$(printf '%s' "$link_name" | sed 's/[. ]*$//')
+            if [ -n "$safe_link_name" ] && [ "$safe_link_name" != "$link_name" ]; then
+                if [ "$DRY_RUN" = false ]; then
+                    if mv "$link" "$folder$safe_link_name" 2>/dev/null; then
+                        log "🪟 Windows-safe: ссылка '$link_name' → '$safe_link_name'"
+                        link="$folder$safe_link_name"
+                        link_name="$safe_link_name"
+                    else
+                        log "❌ Не удалось переименовать ссылку '$link_name' (права?)"
+                    fi
+                else
+                    log "🔍 DRY: ссылка '$link_name' → '$safe_link_name' (Windows-safe)"
+                fi
+            fi
 
             if [ ! -e "$link" ]; then
                 # Битый symlink: цель не существует. Может, папка проекта переименована?

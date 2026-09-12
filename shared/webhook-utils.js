@@ -10,9 +10,19 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// Умная очистка имени для файловой системы (защита от ENAMETOOLONG).
+// Умная очистка имени для файловой системы (защита от ENAMETOOLONG + Windows-safe).
 // maxLength считается в code points (emoji = 1 символ), чтобы обрезка
 // НЕ разрывала суррогатные пары (иначе в имени папки появляется «кракозябра»).
+//
+// 🪟 v4.60.0 (Проблема 128): имя НЕ должно оканчиваться точкой или пробелом.
+// Windows (Explorer/Win32) молча срезает такой хвост, путь перестаёт совпадать —
+// и папка становится недоступной на запись из Проводника («Отказано в доступе»).
+// Клиентский кейс: контакт «Ярошеня С.Н.» → папка «20 - ... - Ярошеня С.Н.»,
+// файлы в неё из Windows не клались. Поэтому:
+//   - многоточие обрезки — '…' (U+2026, один символ), а НЕ '...' (точка на конце!);
+//   - хвост из точек/пробелов срезается всегда.
+// ⚠️ Парная функция в watchdog: modules/fix-fs-structure.sh → sanitize_name().
+// Меняешь здесь — поменяй и там, иначе вебхук и watchdog «передёргивают» имена.
 function sanitizeFolderName(name, maxLength = 50) {
     if (!name) return 'Без названия';
 
@@ -22,10 +32,12 @@ function sanitizeFolderName(name, maxLength = 50) {
 
     const chars = Array.from(clean);                     // code points, не UTF-16 units
     if (chars.length > maxLength) {
-        clean = chars.slice(0, maxLength - 3).join('').trim() + '...';
+        clean = chars.slice(0, maxLength - 1).join('').trim() + '…';
     }
 
-    if (!clean || clean === '...') clean = 'Без названия';
+    clean = clean.replace(/[.\s]+$/g, '');               // 🪟 Windows-safe хвост
+
+    if (!clean) clean = 'Без названия';
     return clean;
 }
 
