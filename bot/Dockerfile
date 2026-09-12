@@ -23,6 +23,15 @@ RUN mkdir -p /home/node/.config /home/node/.cache && chown -R node:node /home/no
 WORKDIR /app
 
 COPY bot/package*.json ./
+
+# ⚡ v4.64.0: НЕ даём puppeteer качать СВОЙ Chromium.
+# Бот запускает системный chromium (`executablePath: '/usr/bin/chromium'`, bot/server.js),
+# поэтому загрузка (~150 МБ) не нужна вообще. Найдено смоук-тестом на чистой VM
+# 12.09.2026: без этих переменных `npm install` уходил в `node install.mjs` и на
+# медленной сети ВИСНЕТ (сборка образа не завершалась, установка «залипала»).
+ENV PUPPETEER_SKIP_DOWNLOAD=1 \
+    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1
+
 RUN npm install --production
 
 COPY bot/server.js bot/bot.js bot/config.js bot/routes.js ./

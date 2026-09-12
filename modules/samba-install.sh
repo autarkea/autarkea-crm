@@ -1,8 +1,14 @@
 #!/bin/bash
 # ============================================================================
-# Printed4U CRM - Модуль установки и настройки Samba (v2.0.4)
+# Printed4U CRM - Модуль установки и настройки Samba (v2.0.5)
 # ============================================================================
 # Назначение: Безопасный сетевой доступ к папкам проектов и клиентов из Windows.
+# ============================================================================
+# 🆕 v2.0.5 (найдено смоук-тестом на чистой VM, 12.09.2026): ВЛАДЕЛЕЦ ДАННЫХ.
+#   Под `sudo` модуль принимал ROOT за владельца: добавлял smbuser в группу root,
+#   делал /mnt/data root:root и писал `force group = root` → Samba ломалась.
+#   Теперь под root владелец берётся из .env (APP_UID/APP_GID); если данных нет —
+#   модуль отказывается работать (лучше остановка, чем испорченные права).
 # ============================================================================
 # 🆕 v2.0.4 (Проблема 130): НАДЁЖНОСТЬ ПРАВ.
 #   - SETGID (бит 2xxx) на каркасе, папках проектов/клиентов и «Рабочих»: новые
@@ -57,14 +63,40 @@ NC='\033[0m'
 
 echo -e "${BLUE}═══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║   Printed4U CRM - Настройка Samba (Сетевые папки)      ║${NC}"
-echo -e "${BLUE}║   Версия: v2.0.4 (Защита файловой системы)             ║${NC}"
+echo -e "${BLUE}║   Версия: v2.0.5 (Защита файловой системы)             ║${NC}"
 echo -e "${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# 1. Определение текущего пользователя и его UID/GID
-CURRENT_USER=$(whoami)
-CURRENT_UID=$(id -u)
-CURRENT_GID=$(id -g)
+# 1. Определение ВЛАДЕЛЬЦА ДАННЫХ и его UID/GID
+# ⚠️ v2.0.5 (найдено смоук-тестом на чистой VM, 12.09.2026): под `sudo` команда
+# `whoami` возвращает root, и модуль принимал ROOT за владельца данных:
+#   - добавлял smbuser в группу root;
+#   - делал /mnt/data/projects|clients|shared владельцем root:root;
+#   - писал в smb.conf `force group = root` → Samba переставала пускать запись.
+# Владелец берётся так же, как в upgrade.sh / backup-install.sh: если мы root —
+# из .env (APP_UID/APP_GID — «источник правды» о владельце данных).
+INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$INSTALL_DIR/.env"
+
+if [ "$(id -u)" -eq 0 ]; then
+    APP_UID_VAL=$(grep -E '^APP_UID=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -dc '0-9')
+    APP_GID_VAL=$(grep -E '^APP_GID=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -dc '0-9')
+    if [ -z "$APP_UID_VAL" ] || [ "$APP_UID_VAL" = "0" ]; then
+        echo -e "${RED}❌ Модуль запущен от root, а владелец данных неизвестен (APP_UID в $ENV_FILE нет).${NC}"
+        echo -e "${YELLOW}   Запуск от root сделал бы /mnt/data владельцем root — это ломает Samba${NC}"
+        echo -e "${YELLOW}   (smbuser попадёт в группу root, в smb.conf уедет 'force group = root').${NC}"
+        echo -e "${CYAN}   Запусти от пользователя-владельца данных: bash modules/samba-install.sh${NC}"
+        exit 1
+    fi
+    CURRENT_UID="$APP_UID_VAL"
+    CURRENT_GID="${APP_GID_VAL:-$APP_UID_VAL}"
+    CURRENT_USER="$(id -nu "$CURRENT_UID" 2>/dev/null || echo "$CURRENT_UID")"
+    echo -e "${YELLOW}ℹ️  Запуск от root: владелец данных взят из .env — ${CURRENT_USER} (UID ${CURRENT_UID}, GID ${CURRENT_GID})${NC}"
+else
+    CURRENT_USER="$(id -un)"
+    CURRENT_UID="$(id -u)"
+    CURRENT_GID="$(id -g)"
+fi
 
 echo -e "${BLUE}👤 Текущий пользователь: ${CURRENT_USER} (UID: ${CURRENT_UID}, GID: ${CURRENT_GID})${NC}"
 echo ""

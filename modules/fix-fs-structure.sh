@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Printed4U CRM - Watchdog файловой системы (v1.2.0)
+# Printed4U CRM - Watchdog файловой системы (v1.3.0)
 # ============================================================================
 # Назначение: Самоисцеление структуры папок. Защита от "кривых рук".
 # Что делает (каждые 5 минут через cron):
@@ -31,6 +31,12 @@
 #   - чиним ГРУППУ данных (chgrp), если мы владелец папки;
 #   - если владелец не мы — предупреждаем с готовой командой (нужен root).
 # ============================================================================
+# 🆕 v1.3.0 (12.09.2026): ЗАЩИТА ОТ ЗАПУСКА ПОД ROOT.
+#   Под `sudo` `id -un` = root → watchdog выставил бы владельцем/группой root и
+#   сломал Samba (тот же баг, что нашли смоук-тестом в samba-install.sh). Теперь
+#   под root владелец берётся из .env (APP_UID/APP_GID); если данных нет — watchdog
+#   просто пропускает проверку (не портит структуру).
+# ============================================================================
 # Использование:
 #   bash modules/fix-fs-structure.sh             # разовая проверка
 #   bash modules/fix-fs-structure.sh --install   # установить в cron (каждые 5 мин)
@@ -48,8 +54,25 @@ CRON_JOB="*/5 * * * * bash $INSTALL_DIR/modules/fix-fs-structure.sh >> $LOG_FILE
 
 # Пользователь и группа данных (v1.2.0): группа, которую должны наследовать новые
 # папки. В cron USER может быть не задан — берём явно из id.
-CUR_USER=$(id -un)
-DATA_GROUP=$(id -gn)
+# ⚠️ v1.3.0 (12.09.2026): под sudo `id -un` = root — тогда watchdog «починил» бы
+# права и группу в root и сломал Samba (тот же баг, что нашли смоук-тестом в
+# samba-install.sh). Владельца берём как upgrade.sh/backup-install.sh: под root —
+# из .env (APP_UID/APP_GID). Нет данных — лучше НЕ трогать структуру, чем портить.
+if [ "$(id -u)" -eq 0 ]; then
+    ENV_FILE="$INSTALL_DIR/.env"
+    APP_UID_VAL=$(grep -E '^APP_UID=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -dc '0-9')
+    APP_GID_VAL=$(grep -E '^APP_GID=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -dc '0-9')
+    if [ -n "$APP_UID_VAL" ] && [ "$APP_UID_VAL" != "0" ]; then
+        CUR_USER="$(id -nu "$APP_UID_VAL" 2>/dev/null || echo "$APP_UID_VAL")"
+        DATA_GROUP="$(getent group "${APP_GID_VAL:-$APP_UID_VAL}" | cut -d: -f1)"
+    else
+        echo "❌ Watchdog запущен от root, а APP_UID в $ENV_FILE нет — пропускаю: иначе он выставил бы владельцем root и сломал Samba." >&2
+        exit 0
+    fi
+else
+    CUR_USER=$(id -un)
+    DATA_GROUP=$(id -gn)
+fi
 
 # ────────────────────────────────────────────────────────────────────────────
 # Цвета и утилиты

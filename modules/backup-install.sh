@@ -473,8 +473,16 @@ ENV_FILE="$INSTALL_DIR/.env"
 # Значения APP_UID/APP_GID обязаны быть только цифрами.
 if grep -qE '^APP_[UG]ID=.*[^0-9]' "$ENV_FILE" 2>/dev/null; then
     echo -e "${YELLOW}⚠️  В .env склеились строки APP_UID/APP_GID (не хватало перевода строки). Восстанавливаю...${NC}"
-    sed -i "s|^APP_UID=.*|APP_UID=$(id -u)|; s|^APP_GID=.*|APP_GID=$(id -g)|" "$ENV_FILE"
-    echo -e "${GREEN}✅ APP_UID/APP_GID восстановлены ($(id -u):$(id -g))${NC}"
+    # ⚠️ v4.64.0 (12.09.2026): под sudo `id -u` = 0 → в .env уехал бы APP_UID=0,
+    # контейнеры писали бы от root, а Samba не могла бы писать в «Рабочие».
+    # Берём владельца данных: SUDO_USER, если модуль запущен через sudo.
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+        FIX_UID="$(id -u "$SUDO_USER")"; FIX_GID="$(id -g "$SUDO_USER")"
+    else
+        FIX_UID="$(id -u)"; FIX_GID="$(id -g)"
+    fi
+    sed -i "s|^APP_UID=.*|APP_UID=${FIX_UID}|; s|^APP_GID=.*|APP_GID=${FIX_GID}|" "$ENV_FILE"
+    echo -e "${GREEN}✅ APP_UID/APP_GID восстановлены (${FIX_UID}:${FIX_GID})${NC}"
 fi
 
 # Проблема 107: перевод строки в конце .env — ДО любой дозаписи.
