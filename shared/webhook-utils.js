@@ -101,6 +101,76 @@ function findExistingProjectFolder(root, projectId, expectedProjName, expectedCl
     return path.join(root, matchingFolders[0]); // наименее разрушительный fallback
 }
 
+// Строгий разбор положительного целого id — общий «предохранитель» (shared/guard.js).
+// Раньше в роутах стоял parseInt() + Number.isInteger: parseInt('1; DROP TABLE') === 1,
+// проверка «проходила», и мусорный id молча трактовался как 1.
+const { parsePositiveInt } = require('./guard');
+
+// Проверка секрета (fail-closed, v4.27.3): нет секрета в .env → 503 (сервис не настроен),
+// неверный секрет → 403. Возвращает результат, чтобы роут сам решил, что отдать.
+function checkSecret(provided, expected) {
+    if (!expected) {
+        return { ok: false, status: 503, error: 'Сервис не настроен: WEBHOOK_SECRET отсутствует в .env' };
+    }
+    if (provided !== expected) {
+        return { ok: false, status: 403, error: 'Неверный секретный ключ' };
+    }
+    return { ok: true };
+}
+
+// Сборка SQL-транзакции «снять связи ключа и поставить новые» для junction-таблиц NocoDB
+// (CE не умеет PATCH Link-полей — правим напрямую). groups — по одной на таблицу:
+// attach-client чистит сразу две (Контакты и Юрлица) в ОДНОЙ транзакции.
+// id уже провалидированы parsePositiveInt (только числа) — интерполяция безопасна.
+function buildJunctionReplaceSql(groups) {
+    const statements = ['BEGIN IMMEDIATE;'];
+    for (const group of groups) {
+        const { table, keyColumn, keyValue, links = [] } = group;
+        statements.push(`DELETE FROM "${table}" WHERE "${keyColumn}" = ${keyValue};`);
+        for (const { column, value } of links) {
+            statements.push(`INSERT INTO "${table}" ("${column}", "${keyColumn}") VALUES (${value}, ${keyValue});`);
+        }
+    }
+    statements.push('COMMIT;');
+    return statements.join('\n');
+}
+
+// Имя папки проекта «{id} - {Проект} - {Клиент}» с очисткой/обрезкой (клиент ≤40, проект ≤60).
+// Возвращает и промежуточные safe-имена — они нужны для симлинка и поля «Файлы в папке».
+function buildProjectFolderName(projectId, rawProjName, rawClientName) {
+    const safeProjName = sanitizeFolderName(rawProjName || `Проект_${projectId}`, 60);
+    const safeClientName = sanitizeFolderName(rawClientName || 'Без клиента', 40);
+    return { safeProjName, safeClientName, folderName: `${projectId} - ${safeProjName} - ${safeClientName}` };
+}
+
+// Client ID из имени папки клиента «Имя (ABC123)» → 'ABC123' или null.
+function parseClientFolderId(folderName) {
+    const m = String(folderName || '').match(/\(([A-Z0-9]{6})\)$/);
+    return m ? m[1] : null;
+}
+
+// HTTP-код для ошибки обработчика: «Не указан клиент» — вина клиента (400),
+// остальное — серверная ошибка (500). Раньше /create-folder отдавал 500, а
+// /refresh-files и /upload-file — 400 на ту же ситуацию (рассинхрон, v4.57.0).
+function errorHttpStatus(message) {
+    return String(message || '').includes('Не указан клиент') ? 400 : 500;
+}
+
+// Multer/busboy декодирует имя файла из multipart как latin1, поэтому кириллица
+// приходит «кракозябрами» и sanitizeFileName превращает её в подчёркивания
+// (тест.txt → ________.txt). Перекодируем latin1→utf8 (для ASCII — без изменений).
+// Если после перекодировки получились «замещающие» символы (U+FFFD), значит строка
+// не была latin1-мисдекодом — возвращаем как есть, чтобы ничего не испортить.
+function decodeUploadFileName(originalname) {
+    const raw = String(originalname || '');
+    try {
+        const utf8 = Buffer.from(raw, 'latin1').toString('utf8');
+        return utf8.includes('\uFFFD') ? raw : utf8;
+    } catch (e) {
+        return raw;
+    }
+}
+
 module.exports = {
     sanitizeFolderName,
     sanitizeFileName,
@@ -108,5 +178,12 @@ module.exports = {
     getLinkedId,
     listFiles,
     generateClientId,
-    findExistingProjectFolder
+    findExistingProjectFolder,
+    parsePositiveInt,
+    checkSecret,
+    buildJunctionReplaceSql,
+    buildProjectFolderName,
+    parseClientFolderId,
+    errorHttpStatus,
+    decodeUploadFileName
 };

@@ -9,7 +9,8 @@
 #   7. Перезапуск   8. diagnose.sh   9. Версия схемы в nc_store
 # Ключи:
 #   --dry-run --skip-backup --skip-git --skip-compose --skip-bot
-#   --skip-diagnose --skip-restart --db-only (только БД-часть, для репетиции на копии)
+#   --skip-diagnose --skip-restart --skip-modules (не трогать host-cron)
+#   --db-only (только БД-часть, для репетиции на копии; = skip-git/compose/bot/restart/diagnose/modules)
 #   --install-dir PATH --db PATH
 # ============================================================================
 # Изменения v1.2.0 (v4.34.3):
@@ -33,6 +34,7 @@ SKIP_COMPOSE=false
 SKIP_BOT=false
 SKIP_DIAGNOSE=false
 SKIP_RESTART=false
+SKIP_MODULES=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -43,7 +45,8 @@ while [ $# -gt 0 ]; do
         --skip-bot)      SKIP_BOT=true ;;
         --skip-diagnose) SKIP_DIAGNOSE=true ;;
         --skip-restart)  SKIP_RESTART=true ;;
-        --db-only)       SKIP_GIT=true; SKIP_COMPOSE=true; SKIP_BOT=true; SKIP_RESTART=true; SKIP_DIAGNOSE=true ;;
+        --skip-modules)  SKIP_MODULES=true ;;
+        --db-only)       SKIP_GIT=true; SKIP_COMPOSE=true; SKIP_BOT=true; SKIP_RESTART=true; SKIP_DIAGNOSE=true; SKIP_MODULES=true ;;
         --install-dir)   INSTALL_DIR="$2"; shift ;;
         --db)            NOCO_DB="$2"; shift ;;
         *) echo "❌ Неизвестный аргумент: $1" >&2; exit 1 ;;
@@ -316,13 +319,15 @@ fi
 # а алерт не ушёл — health-alert в crontab просто не было (в crontab жили
 # только бэкапы). Модули идемпотентны (--install) — безопасно на любой версии.
 # ═══════════════════════════════════════════════════════════════════════════
-if [ "$DRY_RUN" = false ]; then
+if [ "$DRY_RUN" = false ] && [ "$SKIP_MODULES" = false ]; then
     for MOD in modules/health-alert.sh modules/fix-fs-structure.sh; do
         if [ -f "$INSTALL_DIR/$MOD" ]; then
             log "${BLUE}   📡 Доустановка ${MOD} (cron, идемпотентно)...${NC}"
             bash "$INSTALL_DIR/$MOD" --install 2>&1 | sed 's/^/   /'
         fi
     done
+else
+    log "${YELLOW}   📡 Доустановка host-модулей пропущена (--skip-modules / --db-only)${NC}"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

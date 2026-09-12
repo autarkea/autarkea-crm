@@ -12,7 +12,14 @@ const {
     getLinkedId,
     listFiles,
     generateClientId,
-    findExistingProjectFolder
+    findExistingProjectFolder,
+    parsePositiveInt,
+    checkSecret,
+    buildJunctionReplaceSql,
+    buildProjectFolderName,
+    parseClientFolderId,
+    errorHttpStatus,
+    decodeUploadFileName
 } = require('./shared/webhook-utils');
 
 const app = express();
@@ -37,16 +44,16 @@ function requireSecret(req, res, next) {
     // v4.27.3 (fail-closed): нет секрета в .env — НЕ открываем роуты.
     // Раньше было fail-open («пропускаем проверку») — при ручной установке (плейсхолдер
     // your_secret_here) или потере строки в .env все защищённые роуты были открыты всем.
-    if (!WEBHOOK_SECRET) {
-        console.error('❌ WEBHOOK_SECRET не установлен в .env — все защищённые роуты закрыты. Проверь .env и перезапусти setup-formulas.sh');
-        return res.status(503).json({ error: 'Сервис не настроен: WEBHOOK_SECRET отсутствует в .env' });
-    }
+    // Логика вынесена в shared/webhook-utils.js → checkSecret (тесты: webhook-utils.test.js).
+    const check = checkSecret(secret, WEBHOOK_SECRET);
+    if (check.ok) return next();
 
-    if (secret !== WEBHOOK_SECRET) {
+    if (check.status === 503) {
+        console.error('❌ WEBHOOK_SECRET не установлен в .env — все защищённые роуты закрыты. Проверь .env и перезапусти setup-formulas.sh');
+    } else {
         console.log(`❌ Попытка доступа без секретного ключа: ${req.path} (IP: ${req.ip})`);
-        return res.status(403).json({ error: 'Неверный секретный ключ' });
     }
-    next();
+    return res.status(check.status).json({ error: check.error });
 }
 
 const PORT = 3001;
@@ -145,12 +152,10 @@ async function getProjectFolderPath(projectId) {
     // 5. Определяем итоговое имя клиента для папки
     const rawClientName = legalEntityName || contactName || 'Без клиента';
     const rawProjName = project['Что делаем?'] || `Проект_${projectId}`;
-    
-    // 🆕 БЕЗОПАСНАЯ ОЧИСТКА ИМЕН (защита от ENAMETOOLONG)
-    const safeClientName = sanitizeFolderName(rawClientName, 40);
-    const safeProjName = sanitizeFolderName(rawProjName, 60);
-    
-    const expectedFolderName = `${projectId} - ${safeProjName} - ${safeClientName}`;
+
+    // 🆕 БЕЗОПАСНАЯ ОЧИСТКА ИМЕН (защита от ENAMETOOLONG) — общая логика в webhook-utils
+    const { safeProjName, safeClientName, folderName: expectedFolderName } =
+        buildProjectFolderName(projectId, rawProjName, rawClientName);
 
     // 6. 🛡️ ПРОВЕРКА НА СУЩЕСТВОВАНИЕ (Защита от дубликатов при смене клиента)
     const existingPath = findExistingProjectFolder(PROJECTS_ROOT, projectId, safeProjName, safeClientName);
@@ -187,9 +192,10 @@ function createClientFolderAndSymlink(clientId, clientName, projectId, projName,
     let actualClientId = clientId;
 
     if (matchingFolder) {
-        const match = matchingFolder.match(/\(([A-Z0-9]{6})\)$/);
-        if (match) {
-            actualClientId = match[1];
+        // Client ID из имени папки (общая логика в webhook-utils) → приоритет над NocoDB
+        const folderClientId = parseClientFolderId(matchingFolder);
+        if (folderClientId) {
+            actualClientId = folderClientId;
             if (actualClientId !== clientId) {
                 console.log(`🔒 Client ID в NocoDB изменён (${clientId} → ${actualClientId}), используем ID из папки`);
             }
@@ -304,7 +310,8 @@ async function syncProjectDocuments(projectId, projectFolderPath) {
 // ================== РОУТ: СОЗДАТЬ ПАПКУ ==================
 app.all('/create-folder', requireSecret, async (req, res) => {
     try {
-        const projectId = req.query.docId || req.body?.Id || req.body?.id || req.body?.rowId || req.body?.recordId;
+        const rawId = req.query.docId || req.body?.Id || req.body?.id || req.body?.rowId || req.body?.recordId;
+        const projectId = parsePositiveInt(rawId);
         console.log('📦 Получен запрос. ID:', projectId, 'Method:', req.method);
 
         if (!projectId) {
@@ -366,14 +373,18 @@ app.all('/create-folder', requireSecret, async (req, res) => {
 
     } catch (error) {
         console.error('❌ Ошибка вебхука:', error.message);
-        res.status(500).send(getErrorHTML(error.message));
+        // v4.57.0: «Не указан клиент» — ошибка клиента (400), как в /refresh-files и
+        // /upload-file, а не серверная (500): кнопка NocoDB и бот не должны считать
+        // это сбоем сервера и заваливать ретраями.
+        res.status(errorHttpStatus(error.message)).send(getErrorHTML(error.message));
     }
 });
 
 // ================== РОУТ: ОБНОВИТЬ СПИСОК ФАЙЛОВ ==================
 app.all('/refresh-files', requireSecret, async (req, res) => {
     try {
-        const projectId = req.query.docId || req.body?.Id || req.body?.id;
+        const rawId = req.query.docId || req.body?.Id || req.body?.id;
+        const projectId = parsePositiveInt(rawId);
         console.log('🔄 Обновление файлов и документов для проекта ID:', projectId);
 
         if (!projectId) {
@@ -499,23 +510,23 @@ const JUNCTION_CONTACT_LEGAL = 'nc_nw7q___nc_m2m_Контакты_Юрлица';
 
 app.post('/transfer-project', requireSecret, async (req, res) => {
     try {
-        const projectId = parseInt(req.body.projectId);
-        const newManagerId = parseInt(req.body.newManagerId);
-        if (!Number.isInteger(projectId) || projectId <= 0 || !Number.isInteger(newManagerId) || newManagerId <= 0) {
-            return res.status(400).json({ error: 'projectId и newManagerId обязательны' });
+        const projectId = parsePositiveInt(req.body.projectId);
+        const newManagerId = parsePositiveInt(req.body.newManagerId);
+        if (!projectId || !newManagerId) {
+            return res.status(400).json({ error: 'projectId и newManagerId обязательны (положительные целые)' });
         }
         if (!fs.existsSync(NOCO_DB_PATH)) {
             return res.status(500).json({ error: 'Файл БД NocoDB недоступен (нет volume?)' });
         }
 
         // Транзакция: убираем все связи проекта с сотрудниками и ставим нового менеджера.
-        // Числа подставляем напрямую — они валидированы Number.isInteger (только цифры, инъекция невозможна).
-        const sql = [
-            'BEGIN IMMEDIATE;',
-            `DELETE FROM "${JUNCTION_PROJECT_EMPLOYEE}" WHERE "nc_nw7q___Проекты_id" = ${projectId};`,
-            `INSERT INTO "${JUNCTION_PROJECT_EMPLOYEE}" ("nc_nw7q___Сотрудники_id", "nc_nw7q___Проекты_id") VALUES (${newManagerId}, ${projectId});`,
-            'COMMIT;'
-        ].join('\n');
+        // id провалидированы parsePositiveInt (только цифры) — интерполяция безопасна.
+        const sql = buildJunctionReplaceSql([{
+            table: JUNCTION_PROJECT_EMPLOYEE,
+            keyColumn: 'nc_nw7q___Проекты_id',
+            keyValue: projectId,
+            links: [{ column: 'nc_nw7q___Сотрудники_id', value: newManagerId }]
+        }]);
 
         execFileSync('sqlite3', [NOCO_DB_PATH, sql], { timeout: 10000 });
         console.log(`✅ Проект #${projectId} передан менеджеру #${newManagerId}`);
@@ -533,29 +544,35 @@ app.post('/transfer-project', requireSecret, async (req, res) => {
 // одного — связь с другим снимается.
 app.post('/attach-client', requireSecret, async (req, res) => {
     try {
-        const projectId = parseInt(req.body.projectId);
-        const contactId = req.body.contactId ? parseInt(req.body.contactId) : null;
-        const legalId = req.body.legalId ? parseInt(req.body.legalId) : null;
-        if (!Number.isInteger(projectId) || projectId <= 0) {
-            return res.status(400).json({ error: 'projectId обязателен' });
+        const projectId = parsePositiveInt(req.body.projectId);
+        const contactId = req.body.contactId ? parsePositiveInt(req.body.contactId) : null;
+        const legalId = req.body.legalId ? parsePositiveInt(req.body.legalId) : null;
+        if (!projectId) {
+            return res.status(400).json({ error: 'projectId обязателен (положительное целое)' });
         }
         if (!contactId && !legalId) {
-            return res.status(400).json({ error: 'Укажите contactId или legalId' });
+            return res.status(400).json({ error: 'Укажите contactId или legalId (положительные целые)' });
         }
         if (!fs.existsSync(NOCO_DB_PATH)) {
             return res.status(500).json({ error: 'Файл БД NocoDB недоступен (нет volume?)' });
         }
 
-        // Транзакция: снимаем старые связи с клиентами, ставим новую.
-        // Числа подставляем напрямую — валидированы Number.isInteger (инъекция невозможна).
-        const sql = [
-            'BEGIN IMMEDIATE;',
-            `DELETE FROM "${JUNCTION_PROJECT_CONTACT}" WHERE "nc_nw7q___Проекты_id" = ${projectId};`,
-            `DELETE FROM "${JUNCTION_PROJECT_LEGAL}" WHERE "nc_nw7q___Проекты_id" = ${projectId};`,
-            ...(contactId ? [`INSERT INTO "${JUNCTION_PROJECT_CONTACT}" ("nc_nw7q___Контакты_id", "nc_nw7q___Проекты_id") VALUES (${contactId}, ${projectId});`] : []),
-            ...(legalId ? [`INSERT INTO "${JUNCTION_PROJECT_LEGAL}" ("nc_nw7q___Юрлица_id", "nc_nw7q___Проекты_id") VALUES (${legalId}, ${projectId});`] : []),
-            'COMMIT;'
-        ].join('\n');
+        // Транзакция: снимаем старые связи с клиентами, ставим новую (обе таблицы — в одной транзакции).
+        // id провалидированы parsePositiveInt (только цифры) — интерполяция безопасна.
+        const sql = buildJunctionReplaceSql([
+            {
+                table: JUNCTION_PROJECT_CONTACT,
+                keyColumn: 'nc_nw7q___Проекты_id',
+                keyValue: projectId,
+                links: contactId ? [{ column: 'nc_nw7q___Контакты_id', value: contactId }] : []
+            },
+            {
+                table: JUNCTION_PROJECT_LEGAL,
+                keyColumn: 'nc_nw7q___Проекты_id',
+                keyValue: projectId,
+                links: legalId ? [{ column: 'nc_nw7q___Юрлица_id', value: legalId }] : []
+            }
+        ]);
 
         execFileSync('sqlite3', [NOCO_DB_PATH, sql], { timeout: 10000 });
         console.log(`✅ Проект #${projectId} привязан к клиенту (contact=${contactId}, legal=${legalId})`);
@@ -576,21 +593,22 @@ app.post('/attach-client', requireSecret, async (req, res) => {
 // SQL-инъекция невозможна: id валидируются Number.isInteger (числа подставляются).
 app.post('/set-contact-org', requireSecret, async (req, res) => {
     try {
-        const contactId = parseInt(req.body.contactId);
-        const legalId = req.body.legalId ? parseInt(req.body.legalId) : 0;
-        if (!Number.isInteger(contactId) || contactId <= 0 || (req.body.legalId && (!Number.isInteger(legalId) || legalId <= 0))) {
+        const contactId = parsePositiveInt(req.body.contactId);
+        const legalId = req.body.legalId ? parsePositiveInt(req.body.legalId) : 0;
+        if (!contactId || (req.body.legalId && !legalId)) {
             return res.status(400).json({ error: 'contactId обязателен, legalId должен быть положительным числом' });
         }
         if (!fs.existsSync(NOCO_DB_PATH)) {
             return res.status(500).json({ error: 'Файл БД NocoDB недоступен (нет volume?)' });
         }
 
-        const sql = [
-            'BEGIN IMMEDIATE;',
-            `DELETE FROM "${JUNCTION_CONTACT_LEGAL}" WHERE "nc_nw7q___Контакты_id" = ${contactId};`,
-            ...(legalId > 0 ? [`INSERT INTO "${JUNCTION_CONTACT_LEGAL}" ("nc_nw7q___Юрлица_id", "nc_nw7q___Контакты_id") VALUES (${legalId}, ${contactId});`] : []),
-            'COMMIT;'
-        ].join('\n');
+        // id провалидированы parsePositiveInt (только цифры) — интерполяция безопасна.
+        const sql = buildJunctionReplaceSql([{
+            table: JUNCTION_CONTACT_LEGAL,
+            keyColumn: 'nc_nw7q___Контакты_id',
+            keyValue: contactId,
+            links: legalId > 0 ? [{ column: 'nc_nw7q___Юрлица_id', value: legalId }] : []
+        }]);
 
         execFileSync('sqlite3', [NOCO_DB_PATH, sql], { timeout: 10000 });
         console.log(`✅ Контакт #${contactId} ${legalId > 0 ? `привязан к юрлицу #${legalId}` : 'отвязан от юрлица'}`);
@@ -608,12 +626,10 @@ app.post('/upload-file', upload.single('file'), async (req, res) => {
         // Проверяем секрет вручную (multer парсит body после requireSecret)
         // v4.27.3 (fail-closed): секрет обязателен — нет секрета в .env = сервис не настроен.
         const secret = req.query?.secret || req.body?.secret;
-        if (!WEBHOOK_SECRET) {
-            console.error('❌ WEBHOOK_SECRET не установлен в .env — /upload-file закрыт. Проверь .env.');
-            return res.status(503).json({ error: 'Сервис не настроен: WEBHOOK_SECRET отсутствует в .env' });
-        }
-        if (secret !== WEBHOOK_SECRET) {
-            return res.status(403).json({ error: 'Неверный секретный ключ' });
+        const check = checkSecret(secret, WEBHOOK_SECRET);
+        if (!check.ok) {
+            if (check.status === 503) console.error('❌ WEBHOOK_SECRET не установлен в .env — /upload-file закрыт. Проверь .env.');
+            return res.status(check.status).json({ error: check.error });
         }
 
         const taskId = req.body.taskId;
@@ -675,8 +691,10 @@ app.post('/upload-file', upload.single('file'), async (req, res) => {
             fs.chmodSync(docsDir, 0o755);
         }
 
-        // Санитайз имени файла
-        const safeName = sanitizeFileName(file.originalname);
+        // Санитайз имени файла.
+        // v4.57.0: сначала latin1→utf8 (decodeUploadFileName) — иначе кириллица из
+        // multipart приходит «кракозябрами» и целиком превращается в подчёркивания.
+        const safeName = sanitizeFileName(decodeUploadFileName(file.originalname));
 
         // ♻️ Идемпотентность (Проблема 91): при ретрае после частичного успеха
         // (файл записан, но ответ/последующий шаг упали) не создаём дубль — если файл
@@ -711,8 +729,7 @@ app.post('/upload-file', upload.single('file'), async (req, res) => {
         console.error('❌ Ошибка загрузки файла:', error.message);
         // «Не указан клиент» — ошибка клиента (400), а не серверная (500):
         // бот не должен ретраить гарантированную ошибку.
-        const status = error.message.includes('Не указан клиент') ? 400 : 500;
-        res.status(status).json({ error: error.message });
+        res.status(errorHttpStatus(error.message)).json({ error: error.message });
     }
 });
 

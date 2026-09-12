@@ -314,7 +314,14 @@ const STATE = {
 // Структура сессии и дефолты — в shared/session.js (тесты: tests/session.test.js).
 const sessions = new Map();
 
-const bot = new TelegramBot(config.TOKEN, { polling: true });
+const bot = new TelegramBot(config.TOKEN, (() => {
+    // v4.58.0: TELEGRAM_API_BASE позволяет направить бота на МОК Bot API
+    // (tests/mock-telegram) и прогонять сценарии без реального Telegram.
+    // Без переменной — прежнее поведение (api.telegram.org).
+    const o = { polling: true };
+    if (process.env.TELEGRAM_API_BASE) o.baseApiUrl = process.env.TELEGRAM_API_BASE;
+    return o;
+})());
 
 // ================== WATCHDOG ПОЛЛИНГА (v4.46.0, Проблема 117) ==================
 // Клиентский кейс (05.09.2026): одиночный «EFATAL: read ECONNRESET» → следующий
@@ -1554,9 +1561,9 @@ bot.onText(/\/skip/, async (msg) => {
         // Если есть известный username из пересылки — показываем его
         const knownUsername = sess.pendingContactAction.forwardedData?.username;
         if (knownUsername) {
-            bot.sendMessage(chatId, `⏭️ Телефон пропущен.\n\n🔗 *Username:* @${escapeMarkdown(knownUsername)}\n\n💡 *Введи новый username* или /skip чтобы использовать указанный.`, { parse_mode: 'Markdown' });
+            bot.sendMessage(chatId, `⏭️ Телефон пропущен.\n\nШаг 3️⃣ из 5\n\n🔗 *Username:* @${escapeMarkdown(knownUsername)}\n\n💡 *Введи новый username* или /skip чтобы использовать указанный.`, { parse_mode: 'Markdown' });
         } else {
-            bot.sendMessage(chatId, '⏭️ Телефон пропущен.\n\n🔗 *Введи Telegram username* (например, @vasiok) или /skip:', { parse_mode: 'Markdown' });
+            bot.sendMessage(chatId, '⏭️ Телефон пропущен.\n\nШаг 3️⃣ из 5\n\n🔗 *Введи Telegram username* (например, @vasiok) или /skip:', { parse_mode: 'Markdown' });
         }
         return;
     }
@@ -1569,7 +1576,9 @@ bot.onText(/\/skip/, async (msg) => {
             sess.contactDraft.username = null;
         }
         sess.state = STATE.WAITING_CONTACT_EMAIL;
-        bot.sendMessage(chatId, `⏭️ Username: ${sess.contactDraft.username ? '@' + escapeMarkdown(sess.contactDraft.username) : 'пропущен'}\n\n📧 *Напиши E-mail* (или /skip):`, { parse_mode: 'Markdown' }); return;
+        // v4.58.0: добавляем «Шаг 4️⃣ из 5» — в обычном пути он есть, а в skip-пути
+        // терялся, и пользователь не понимал, на каком он шаге из пяти.
+        bot.sendMessage(chatId, `⏭️ Username: ${sess.contactDraft.username ? '@' + escapeMarkdown(sess.contactDraft.username) : 'пропущен'}\n\nШаг 4️⃣ из 5\n\n📧 *Напиши E-mail* (или /skip):`, { parse_mode: 'Markdown' }); return;
     }
     if (sess.state === STATE.WAITING_CONTACT_EMAIL) {
         sess.contactDraft.email = null;
@@ -1630,7 +1639,13 @@ bot.on('text', async (msg) => {
     // Раньше «незнакомец» (не в кэше сотрудников) получал роль Исполнителя
     // по умолчанию и мог вручную написать кнопку меню («📋 Все задачи» и т.п.) —
     // списки не фильтровались (emp = null → видно всё).
-    if (!msg.from || !isAllowed(msg.from.id)) return bot.sendMessage(msg.chat.id, '⛔ Доступ запрещён');
+    if (!msg.from || !isAllowed(msg.from.id)) {
+        // v4.58.0: команду («/…») обработает её собственный bot.onText(...) — там тоже
+        // есть ответ («Доступ запрещён» / «нет прав»). Для команд здесь молчим, иначе
+        // неавторизованный получал ДВЕ одинаковые плашки (найдено tests/telegram-e2e.sh).
+        if (!text.startsWith('/')) bot.sendMessage(msg.chat.id, '⛔ Доступ запрещён');
+        return;
+    }
 
     if (msg.forward_date) return;
 

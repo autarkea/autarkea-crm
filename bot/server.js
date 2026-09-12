@@ -7,6 +7,8 @@ const path = require('path');
 const nodemailer = require('nodemailer');
 // v4.37.0: единый расчёт НДС (shared/vat.js) — используется в bot.js и server.js.
 const vat = require('./shared/vat');
+// v4.58.0: общие «предохранители» — строгий id и безопасный путь (Проблемы 122/124).
+const { parsePositiveInt, safeJoinWithin } = require('./shared/guard');
 
 const app = express();
 app.use(express.json());
@@ -174,11 +176,22 @@ function generateDocNumber(dateStr, id) {
 }
 
 // ================== SMTP НАСТРОЙКИ ==================
+// v4.58.0 (Проблема 125): раньше `secure` был жёстко `true`, а `SMTP_SECURE` /
+// `SMTP_REJECT_UNAUTHORIZED` (их пишет email-install.sh в .env) ИГНОРИРОВАЛИСЬ.
+// Последствия: у клиента с STARTTLS (порт 587) отправка не работала, и нельзя
+// было подключить локальный тестовый приёмник.
+const SMTP_SECURE = process.env.SMTP_SECURE === 'true';
+// Аутентификация — только если задан пользователь (релеи/тестовые приёмники
+// часто работают без AUTH; пустой auth.nodemailer всё равно пытается логиниться).
+const SMTP_AUTH = process.env.SMTP_USER
+    ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    : undefined;
 const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: parseInt(process.env.SMTP_PORT || '465'),
-    secure: true,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    secure: SMTP_SECURE,
+    ...(SMTP_AUTH ? { auth: SMTP_AUTH } : {}),
+    tls: { rejectUnauthorized: process.env.SMTP_REJECT_UNAUTHORIZED !== 'false' }
 });
 
 // ================== ОТПРАВКА EMAIL ==================
@@ -376,23 +389,41 @@ async function generatePDF(docId) {
 
 // ================== ПРОКСИ-РОУТЫ ==================
 app.get('/api/doc/:id', requireSecret, async (req, res) => {
+    const id = parsePositiveInt(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Некорректный id' });
     try {
-        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${TABLE_DOCS}/${req.params.id}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
+        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${TABLE_DOCS}/${id}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
         res.json(response.data);
     } catch (err) { res.status(err.response?.status || 500).json({ error: err.message }); }
 });
 
 app.get('/api/project/:id', requireSecret, async (req, res) => {
+    const id = parsePositiveInt(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Некорректный id' });
     try {
-        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${TABLE_PROJECTS}/${req.params.id}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
+        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${TABLE_PROJECTS}/${id}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
         res.json(response.data);
     } catch (err) { res.status(err.response?.status || 500).json({ error: err.message }); }
 });
 
 app.get('/api/items', requireSecret, async (req, res) => {
     try {
-        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${TABLE_ITEMS}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
-        res.json(response.data);
+        // v4.58.0 (Проблема 127): NocoDB отдаёт список страницами по 25 строк, а шаблоны
+        // документов (счёт/акт/накладная) фильтруют ЭТОТ список по проекту — значит позиции
+        // с Id > 25 молча не попадали в документы. Тянем все страницы.
+        const all = [];
+        let page = 1;
+        for (;;) {
+            const r = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${TABLE_ITEMS}?limit=1000&page=${page}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
+            const list = (r.data && r.data.list) || [];
+            all.push(...list);
+            const pi = (r.data && r.data.pageInfo) || {};
+            if (pi.isLastPage === true || list.length === 0) break;
+            page += 1;
+            if (page > 100) break; // страховка от бесконечного цикла
+        }
+        console.log(`📦 /api/items: отдаю ${all.length} позиций (страниц: ${page})`);
+        res.json({ list: all, pageInfo: { totalRows: all.length, page: 1, pageSize: all.length, isFirstPage: true, isLastPage: true } });
     } catch (err) { res.status(err.response?.status || 500).json({ error: err.message }); }
 });
 
@@ -404,15 +435,19 @@ app.get('/api/my-details', requireSecret, async (req, res) => {
 });
 
 app.get('/api/client/:id', requireSecret, async (req, res) => {
+    const id = parsePositiveInt(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Некорректный id' });
     try {
-        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${process.env.TABLE_LEGAL_ENTITIES}/${req.params.id}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
+        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${process.env.TABLE_LEGAL_ENTITIES}/${id}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
         res.json(response.data);
     } catch (err) { res.status(err.response?.status || 500).json({ error: err.message }); }
 });
 
 app.get('/api/contact/:id', requireSecret, async (req, res) => {
+    const id = parsePositiveInt(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Некорректный id' });
     try {
-        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${process.env.TABLE_CONTACTS}/${req.params.id}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
+        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${process.env.TABLE_CONTACTS}/${id}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
         res.json(response.data);
     } catch (err) { res.status(err.response?.status || 500).json({ error: err.message }); }
 });
@@ -434,16 +469,26 @@ app.get('/api/doc-settings', requireSecret, async (req, res) => {
 });
 
 app.get('/api/employee/:id', requireSecret, async (req, res) => {
+    const id = parsePositiveInt(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Некорректный id' });
     try {
         const tableEmployees = process.env.TABLE_EMPLOYEES;
         if (!tableEmployees) return res.status(500).json({ error: 'TABLE_EMPLOYEES не найден' });
-        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${tableEmployees}/${req.params.id}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
+        const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${tableEmployees}/${id}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
         res.json(response.data);
     } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/pdfs/:filename', requireSecret, (req, res) => {
-    const pdfPath = path.join('/mnt/data/noco-static/pdfs', req.params.filename);
+    // 🔒 v4.58.0 (Проблема 124): имя приходит из URL и раньше подставлялось в
+    // path.join как есть → `/pdfs/..%2f..%2f..%2fetc%2fpasswd` читал ЛЮБОЙ файл
+    // контейнера (проверено: /etc/passwd и rclone.conf с облачными кредами).
+    // Теперь допустимо только «простое» имя файла внутри каталога PDF.
+    const pdfPath = safeJoinWithin(PDF_DIR, req.params.filename);
+    if (!pdfPath) {
+        console.log(`🚫 /pdfs: отклонён небезопасный путь: ${req.params.filename}`);
+        return res.status(400).send(getPDFNotFoundHTML(req.params.filename, null));
+    }
     if (!fs.existsSync(pdfPath)) return res.status(404).send(getPDFNotFoundHTML(req.params.filename, null));
     res.sendFile(pdfPath);
 });
@@ -715,7 +760,18 @@ async function prepareDocEmail(docId, overrideToEmail = '') {
     const override = String(overrideToEmail || '').trim();
     if (override) {
         const idx = candidates.findIndex(c => c.email.toLowerCase() === override.toLowerCase());
-        if (idx >= 0) selected = idx;
+        if (idx >= 0) {
+            selected = idx;
+        } else {
+            // v4.58.0 (Проблема 126): адрес, ЯВНО переданный вызывающим и не совпавший
+            // ни с одним кандидатом, используется как есть. Раньше в этом случае молча
+            // оставался candidates[0] — письмо уходило НЕ туда, куда просили
+            // (риск отправить документ чужому клиенту).
+            candidates.push({ kind: 'custom', name: 'Получатель', email: override, greeting: 'Здравствуйте!' });
+            selected = candidates.length - 1;
+            Object.assign(candidates[selected], buildMail(candidates[selected].greeting));
+            console.log(`📧 Получатель задан явно (вне списка кандидатов): ${override}`);
+        }
     }
     const sel = candidates[selected];
 
