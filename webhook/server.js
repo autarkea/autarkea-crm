@@ -205,7 +205,7 @@ function createClientFolderAndSymlink(clientId, clientName, projectId, projName,
         const clientFolderName = `${safeClientName} (${clientId})`;
         clientFolderPath = path.join(CLIENTS_ROOT, clientFolderName);
         fs.mkdirSync(clientFolderPath, { recursive: true });
-        fs.chmodSync(clientFolderPath, 0o755);
+        fs.chmodSync(clientFolderPath, 0o2755);
         console.log(`📁 Создана папка клиента: ${clientFolderPath}`);
     }
 
@@ -328,11 +328,11 @@ app.all('/create-folder', requireSecret, async (req, res) => {
         // 🔒 Права: каркас 0755 (только владелец пишет), Рабочие 0775 (песочница для записи), Документы 0755 (только чтение)
         if (!fs.existsSync(folderPath)) {
             fs.mkdirSync(folderPath, { recursive: true });
-            fs.chmodSync(folderPath, 0o755);
+            fs.chmodSync(folderPath, 0o2755);
             console.log(`✅ Создана папка проекта: ${folderPath}`);
         } else {
             // Если папка существовала — приводим права к безопасной схеме
-            fs.chmodSync(folderPath, 0o755);
+            fs.chmodSync(folderPath, 0o2755);
         }
 
         const workingDir = path.join(folderPath, 'Рабочие');
@@ -340,15 +340,15 @@ app.all('/create-folder', requireSecret, async (req, res) => {
 
         if (!fs.existsSync(workingDir)) {
             fs.mkdirSync(workingDir, { recursive: true });
-            fs.chmodSync(workingDir, 0o775);
+            fs.chmodSync(workingDir, 0o2775);
         } else {
-            fs.chmodSync(workingDir, 0o775);
+            fs.chmodSync(workingDir, 0o2775);
         }
         if (!fs.existsSync(docsDir)) {
             fs.mkdirSync(docsDir, { recursive: true });
-            fs.chmodSync(docsDir, 0o755);
+            fs.chmodSync(docsDir, 0o2755);
         } else {
-            fs.chmodSync(docsDir, 0o755);
+            fs.chmodSync(docsDir, 0o2755);
         }
 
         createClientFolderAndSymlink(clientId, clientName, projectId, projName, folderPath);
@@ -410,9 +410,9 @@ app.all('/refresh-files', requireSecret, async (req, res) => {
         const docsDir = path.join(folderPath, 'Документы');
         if (!fs.existsSync(docsDir)) {
             fs.mkdirSync(docsDir, { recursive: true });
-            fs.chmodSync(docsDir, 0o755);
+            fs.chmodSync(docsDir, 0o2755);
         } else {
-            fs.chmodSync(docsDir, 0o755);
+            fs.chmodSync(docsDir, 0o2755);
         }
 
         await syncProjectDocuments(projectId, folderPath);
@@ -672,23 +672,23 @@ app.post('/upload-file', upload.single('file'), async (req, res) => {
         // 🔒 Права: каркас 0755, Рабочие 0775 (песочница), Документы 0755 (только чтение)
         if (!fs.existsSync(folderPath)) {
             fs.mkdirSync(folderPath, { recursive: true });
-            fs.chmodSync(folderPath, 0o755);
+            fs.chmodSync(folderPath, 0o2755);
             console.log(`✅ Создана папка проекта: ${folderPath}`);
         } else {
-            fs.chmodSync(folderPath, 0o755);
+            fs.chmodSync(folderPath, 0o2755);
         }
         if (!fs.existsSync(workingDir)) {
             fs.mkdirSync(workingDir, { recursive: true });
-            fs.chmodSync(workingDir, 0o775);
+            fs.chmodSync(workingDir, 0o2775);
         } else {
-            fs.chmodSync(workingDir, 0o775);
+            fs.chmodSync(workingDir, 0o2775);
         }
         const docsDir = path.join(folderPath, 'Документы');
         if (!fs.existsSync(docsDir)) {
             fs.mkdirSync(docsDir, { recursive: true });
-            fs.chmodSync(docsDir, 0o755);
+            fs.chmodSync(docsDir, 0o2755);
         } else {
-            fs.chmodSync(docsDir, 0o755);
+            fs.chmodSync(docsDir, 0o2755);
         }
 
         // Санитайз имени файла.

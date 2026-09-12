@@ -1,8 +1,18 @@
 #!/bin/bash
 # ============================================================================
-# Printed4U CRM - Модуль установки и настройки Samba (v2.0.3)
+# Printed4U CRM - Модуль установки и настройки Samba (v2.0.4)
 # ============================================================================
 # Назначение: Безопасный сетевой доступ к папкам проектов и клиентов из Windows.
+# ============================================================================
+# 🆕 v2.0.4 (Проблема 130): НАДЁЖНОСТЬ ПРАВ.
+#   - SETGID (бит 2xxx) на каркасе, папках проектов/клиентов и «Рабочих»: новые
+#     элементы наследуют ГРУППУ родителя, а не GID процесса → папка, созданная
+#     вебхуком, сразу доступна на запись SMB-пользователю;
+#   - та же логика в Samba: directory mask / force directory mode = 2775;
+#   - SELF-TEST ЗАПИСИ: после настройки реально пробуем создать файл в первой
+#     попавшейся «Рабочей» папке от имени smbuser (то же, что делает Samba).
+#     Молчаливая поломка прав («папка создана, а файлы не закинуть») теперь
+#     превращается во внятную ошибку с командой починки.
 # ============================================================================
 # 🆕 v2.0.3: ДОКАТКА ИЗ upgrade.sh. Модуль можно запускать неинтерактивно
 #            (SAMBA_UPGRADE=1) — финальная пауза «запиши пароль» пропускается,
@@ -47,7 +57,7 @@ NC='\033[0m'
 
 echo -e "${BLUE}═══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║   Printed4U CRM - Настройка Samba (Сетевые папки)      ║${NC}"
-echo -e "${BLUE}║   Версия: v2.0.3 (Защита файловой системы)             ║${NC}"
+echo -e "${BLUE}║   Версия: v2.0.4 (Защита файловой системы)             ║${NC}"
 echo -e "${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -94,24 +104,27 @@ fi
 
 # 🆕 v2.0.0: Принудительно выставляем безопасные права на каркас
 # 0755 = владелец пишет (вебхук), остальные только читают (SMB не может переименовать)
-sudo chmod 0755 /mnt/data/projects
-sudo chmod 0755 /mnt/data/clients
+# 🆕 v2.0.4: setgid (2755) — новые элементы наследуют группу родителя (см. шапку модуля)
+sudo chmod 2755 /mnt/data 2>/dev/null || true
+sudo chmod 2755 /mnt/data/projects
+sudo chmod 2755 /mnt/data/clients
 sudo chown ${CURRENT_UID}:${CURRENT_GID} /mnt/data/projects /mnt/data/clients
 
 # 🆕 v2.0.0: Приводим существующие папки проектов к безопасной схеме
 # (каркас проекта и "Документы" — только чтение, "Рабочие" — запись для группы)
+# 🆕 v2.0.4: везде setgid — чтобы и папка, и будущие вложенные элементы держали группу данных
 if [ -d "/mnt/data/projects" ]; then
     for proj_dir in /mnt/data/projects/*/; do
         [ -d "$proj_dir" ] || continue
         sudo chown ${CURRENT_UID}:${CURRENT_GID} "$proj_dir" || true
-        sudo chmod 0755 "$proj_dir" || true
+        sudo chmod 2755 "$proj_dir" || true
         if [ -d "$proj_dir/Рабочие" ]; then
             sudo chown ${CURRENT_UID}:${CURRENT_GID} "$proj_dir/Рабочие" || true
-            sudo chmod 0775 "$proj_dir/Рабочие" || true
+            sudo chmod 2775 "$proj_dir/Рабочие" || true
         fi
         if [ -d "$proj_dir/Документы" ]; then
             sudo chown ${CURRENT_UID}:${CURRENT_GID} "$proj_dir/Документы" || true
-            sudo chmod 0755 "$proj_dir/Документы" || true
+            sudo chmod 2755 "$proj_dir/Документы" || true
         fi
     done
 fi
@@ -121,7 +134,7 @@ if [ -d "/mnt/data/clients" ]; then
     for client_dir in /mnt/data/clients/*/; do
         [ -d "$client_dir" ] || continue
         sudo chown ${CURRENT_UID}:${CURRENT_GID} "$client_dir" || true
-        sudo chmod 0755 "$client_dir" || true
+        sudo chmod 2755 "$client_dir" || true
     done
 fi
 
@@ -325,9 +338,9 @@ sudo tee /etc/samba/smb.conf > /dev/null <<EOF
    guest ok = no
    valid users = ${SMB_USER}
    create mask = 0664
-   directory mask = 0775
+   directory mask = 2775
    force create mode = 0664
-   force directory mode = 0775
+   force directory mode = 2775
 
    # 🆕 v2.0.0: Прячем системный мусор Windows и Mac
    veto files = /Thumbs.db/desktop.ini/.DS_Store/
@@ -381,6 +394,32 @@ if command -v ufw &> /dev/null; then
         echo -e "${GREEN}✅ Правила UFW обновлены${NC}"
     fi
 fi
+
+# ============================================================================
+# 🧪 v2.0.4 (Проблема 130): SELF-TEST ЗАПИСИ от имени SMB-пользователя.
+# Проверяем ровно то, что делает Samba (force user = smbuser): может ли он создать
+# файл в реальной папке «Рабочие». Молчаливая поломка прав («папку создал, а файлы
+# не закинуть») хуже явной ошибки, поэтому — проверяем и говорим прямо.
+# ============================================================================
+TEST_PROJ=$(ls -d /mnt/data/projects/*/ 2>/dev/null | head -n1)
+if [ -n "$TEST_PROJ" ] && [ -d "${TEST_PROJ}Рабочие" ]; then
+    TEST_FILE="${TEST_PROJ}Рабочие/.samba_write_test"
+    if sudo -u "$SMB_USER" touch "$TEST_FILE" 2>/dev/null; then
+        sudo rm -f "$TEST_FILE" 2>/dev/null || true
+        echo -e "${GREEN}✅ Self-test записи: $SMB_USER может писать в «Рабочие»${NC}"
+    else
+        echo -e "${RED}❌ Self-test записи: $SMB_USER НЕ может писать в «Рабочие»:${NC}"
+        echo -e "${YELLOW}   ${TEST_PROJ}Рабочие${NC}"
+        echo -e "${YELLOW}   Что проверить и как починить:${NC}"
+        echo -e "${CYAN}      id -nG $SMB_USER                       # в списке должна быть группа данных${NC}"
+        echo -e "${CYAN}      ls -ld '${TEST_PROJ}Рабочие'            # владелец и группа папки${NC}"
+        echo -e "${CYAN}      sudo chown ${CURRENT_UID}:${CURRENT_GID} '${TEST_PROJ}Рабочие'\\${NC}"
+        echo -e "${CYAN}           && sudo chmod 2775 '${TEST_PROJ}Рабочие'${NC}"
+    fi
+else
+    echo -e "${YELLOW}ℹ️  Self-test записи пропущен: пока нет ни одного проекта с папкой «Рабочие»${NC}"
+fi
+echo ""
 
 # ============================================================================
 # ФИНАЛЬНОЕ СООБЩЕНИЕ С ПАУЗОЙ И ПОЛНОЙ ИНФОРМАЦИЕЙ
