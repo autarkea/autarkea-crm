@@ -9,6 +9,9 @@ const nodemailer = require('nodemailer');
 const vat = require('./shared/vat');
 // v4.58.0: общие «предохранители» — строгий id и безопасный путь (Проблемы 122/124).
 const { parsePositiveInt, safeJoinWithin } = require('./shared/guard');
+// v4.64.4: проверка/выбор email для Reply-To (мусор в справочнике не должен
+// ронять письмо клиенту) — чистая логика в shared, юнит-тесты.
+const { pickEmail } = require('./shared/email-utils');
 
 const app = express();
 app.use(express.json());
@@ -197,15 +200,21 @@ const transporter = nodemailer.createTransport({
 // ================== ОТПРАВКА EMAIL ==================
 async function sendEmailWithPDF({ toEmail, subject, text, html, pdfPath, pdfFileName, managerEmail }) {
     console.log(`📧 Отправка email на ${toEmail}...`);
-    
-    const replyToEmail = managerEmail || process.env.SMTP_FROM;
-    const bccEmail = managerEmail || process.env.SMTP_FROM;
+
+    // v4.64.4 (Вариант А): скрытая копия (Bcc) УБРАНА.
+    //   Раньше Bcc уходил на email менеджера проекта — «копия для контроля».
+    //   Побочные эффекты перевесили: (1) риск утечки документа на чужой/битый адрес
+    //   из справочника, (2) bounce-письма от несуществующих ящиков → порча репутации
+    //   отправителя (письма клиентам улетают в спам), (3) мусор в «E-mail» ронял Reply-To.
+    //   «Отправлено или нет» и так видно: подтверждение в боте, статус «Отправлен» +
+    //   «Дата отправки» в карточке, messageId в логе; а «слепок» письма — PDF в папке проекта.
+    // Reply-To остаётся менеджеру (клиент отвечает адресно); мусор/пусто → общий ящик.
+    const replyToEmail = pickEmail(managerEmail, process.env.SMTP_FROM);
 
     const mailOptions = {
         from: `"CRM" <${process.env.SMTP_FROM}>`,
         to: toEmail,
         replyTo: replyToEmail,
-        bcc: bccEmail,
         subject: subject,
         text: text,
         html: html,
@@ -673,7 +682,9 @@ async function prepareDocEmail(docId, overrideToEmail = '') {
         }
     } catch (e) { console.log(`⚠️ prepareDocEmail: настройки документов: ${e.message}`); }
 
-    // Менеджер (Reply-To/BCC/подпись) — из «Менеджера» проекта, fallback на SMTP_FROM
+    // Менеджер (Reply-To/подпись) — из «Менеджера» проекта, fallback на SMTP_FROM.
+    // v4.64.4: email берём только если он похож на адрес (pickEmail) — иначе Reply-To
+    // с мусором роняет отправку клиенту.
     let manager = { name: '', email: process.env.SMTP_FROM, phone: '', position: '', company: '', website: '' };
     const managerId = extractId(project?.['Менеджер']);
     if (managerId) {
@@ -681,7 +692,7 @@ async function prepareDocEmail(docId, overrideToEmail = '') {
             const empRes = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${process.env.TABLE_EMPLOYEES}/${managerId}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
             manager = {
                 name: empRes.data['ФИО'] || empRes.data['Обращение'] || companyName,
-                email: empRes.data['E-mail'] || process.env.SMTP_FROM,
+                email: pickEmail(empRes.data['E-mail'], process.env.SMTP_FROM),
                 phone: empRes.data['Телефон'] || '',
                 position: empRes.data['Должность'] || '',
                 company: companyName, website: ''
@@ -830,7 +841,7 @@ app.get('/send-email', requireSecret, async (req, res) => {
                 const empRes = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${process.env.TABLE_EMPLOYEES}/${managerId}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
                 manager = {
                     name: empRes.data['ФИО'] || empRes.data['Обращение'] || '',
-                    email: empRes.data['E-mail'] || process.env.SMTP_FROM,
+                    email: pickEmail(empRes.data['E-mail'], process.env.SMTP_FROM),
                     phone: empRes.data['Телефон'] || '',
                     position: empRes.data['Должность'] || '',
                     company: '', website: ''
@@ -976,7 +987,7 @@ app.post('/send-email', requireSecret, async (req, res) => {
             const mId = extractId(projRes.data['Менеджер']);
             if (mId) {
                 const empRes = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${process.env.TABLE_EMPLOYEES}/${mId}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
-                managerEmail = empRes.data['E-mail'] || process.env.SMTP_FROM;
+                managerEmail = pickEmail(empRes.data['E-mail'], process.env.SMTP_FROM);
             }
         } catch (e) { console.log(`⚠️ Не удалось получить email менеджера: ${e.message}`); }
 
@@ -1213,7 +1224,7 @@ function getEmailFormHTML({ docId, secret, docType, projectName, pdfFileName, pd
     ${managerNotFound ? `
     <div style="background: #fff3cd; border: 1px solid #ffc107; color: #856404; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
         <strong>⚠️ Внимание:</strong> Менеджер не указан в проекте.<br>
-        Письмо уйдёт от общего ящика (${process.env.SMTP_FROM}), и копия тоже уйдёт туда.<br>
+        Письмо уйдёт от общего ящика (${process.env.SMTP_FROM}); ответы клиента придут туда же.<br>
         <a href="${NOCO_BASE_URL}/dashboard" target="_blank" style="color: #856404; text-decoration: underline; font-weight: bold;">Открыть NocoDB → заполните поле "Менеджер" в проекте</a>
     </div>
     ` : ''}
@@ -1223,8 +1234,7 @@ function getEmailFormHTML({ docId, secret, docType, projectName, pdfFileName, pd
         <p><strong>Файл:</strong> ${pdfFileName}<br>
         ${sumBlock}<br>
         <strong>От имени:</strong> ${responsible.name}<br>
-        <strong>📬 Ответы (Reply-To):</strong> ${responsible.email}<br>
-        <strong>📋 Копия (BCC):</strong> ${responsible.email}</p>
+        <strong>📬 Ответы (Reply-To):</strong> ${responsible.email}</p>
         ${isNotSigned ? '<p style="color: var(--error-color); margin-top: 10px; font-weight: bold;">⚠️ ВНИМАНИЕ: Документ БЕЗ печати и подписи!</p>' : ''}
         <p style="margin-top: 15px;">
             <a href="${pdfUrl}" target="_blank" style="display: inline-block; background: #3498db; color: white; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-size: 14px;">👁 Предпросмотр PDF</a>
