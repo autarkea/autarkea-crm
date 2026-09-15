@@ -8,8 +8,8 @@
 //   const COL = require('../shared/columns');
 //   const title = task[COL.TASK_TITLE];  // вместо task['Что делаем?']
 //
-// Обновлено: 22 июля 2026 (полная выгрузка из template.db)
-// Всего бизнес-колонок: 104 (исключены системные NocoDB и M2M связи)
+// Обновлено: 15 сентября 2026 (после дельт U014–U015 и переэкспорта эталона)
+// Всего бизнес-колонок: 106 (исключены системные NocoDB и M2M связи)
 // ============================================================================
 
 module.exports = {
@@ -66,6 +66,7 @@ module.exports = {
     CONTACT_INFO: 'c9ge50wk936q4rv',  // "Доп. информация"
     CONTACT_CLIENT_ID: 'c8c2mdbayhxtbij',  // "Client ID"
     CONTACT_ORGANIZATION: 'cccymiivj9ekdzq',  // "Организация"
+    CONTACT_IS_RESPONSIBLE: 'cd0llps1v4xchbr',  // "Юрлица (я ответственный)"
     CONTACT_PROJECTS: 'cwphr7vuj65fn7h',  // "Проекты"
 
     // =========================================================================
@@ -149,6 +150,7 @@ module.exports = {
     LEGAL_BANK: 'c470sxughpj0ikx',  // "Банк"
     LEGAL_IBAN: 'cbk2evqsldwfw7a',  // "р/с"
     LEGAL_EXTRA_INFO: 'cmxu0siikv4bfy1',  // "Дополнительно"
-    LEGAL_CONTACT_PERSON: 'cyzqbprdn7u9agx',  // "Контакт/ответственный"
+    LEGAL_CONTACT_PERSON: 'cfqf27boqktyef1',  // "Контакт/ответственный"
+    LEGAL_CONTACTS: 'cyzqbprdn7u9agx',  // "Контакты Юрлица"
     LEGAL_PROJECTS: 'cjs4z2811wniv8g',  // "Проекты"
 };

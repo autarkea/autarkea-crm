@@ -27,6 +27,8 @@ module.exports = function createMainHandlers(ctx) {
         sendProjectsList, sendProjectDetails, sendProjectStatusMenu,
         sendProjectTasksList, sendProjectItemsList, sendProjectItemDetails,
         sendProjectDocsList, sendDocCard, sendDocCreateConfirm, generateDocPdfAndSend,
+        // v4.65.0: настройка НДС из бота (кнопка «🛠 Задать ставку НДС»)
+        sendVatFixMenu, applyVatTypeChoice,
         todayNocoDate, docTypeKeyboard, sendPaymentMenu, sendArchivedProjects, sendTransferMenu, sendDeadlinePicker,
         sendContactEditMenu, sendLegalEditMenu,
         applyContactFieldEdit, applyContactMessengerEdit, applyLegalFieldEdit,
@@ -40,6 +42,30 @@ async function handleCallbackBlockA(callbackQuery) {
     const sess = getSession(sessions, chatId);
 
     try {
+        // ================== НАСТРОЙКА НДС (v4.65.0, только Руководитель) ==================
+        // Кнопка «🛠 Задать ставку НДС» появляется, когда настройка противоречива
+        // (тип с налогом + пустая ставка) — иначе генерация документов заблокирована.
+        // Guard роли центральный: bot/routes.js → ADMIN_ONLY_PREFIXES (префикс 'vat_').
+        if (data.startsWith('vat_')) {
+            bot.answerCallbackQuery(callbackQuery.id).catch(() => {});
+            const action = data.slice(4); // fix | set_none | set_top | set_incl | cancel
+            try {
+                if (action === 'cancel') {
+                    resetState(chatId);
+                    await bot.sendMessage(chatId, '❌ Настройка НДС отменена.');
+                } else if (action === 'fix') {
+                    await sendVatFixMenu(chatId, msg.message_id);
+                } else {
+                    const keys = { set_none: 'none', set_top: 'top', set_incl: 'incl' };
+                    const key = keys[action];
+                    if (key) await applyVatTypeChoice(chatId, key);
+                }
+            } catch (err) {
+                bot.sendMessage(chatId, `❌ Не удалось сохранить настройку НДС: ${err.message}`).catch(() => {});
+            }
+            return;
+        }
+
         // ================== ВЫБОР СРОКА (быстрые кнопки dl_*) ==================
         if (data.startsWith('dl_')) {
             const option = data.split('_')[1];

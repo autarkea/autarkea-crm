@@ -8,8 +8,10 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo -e "${BLUE}═══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║   Экспорт рабочей базы в шаблон template.db v3.0.3     ║${NC}"
+echo -e "${BLUE}║   Экспорт рабочей базы в шаблон template.db v3.1.0     ║${NC}"
 echo -e "${BLUE}║   🆕 Нормализация order + установка is_default        ║${NC}"
+echo -e "${BLUE}║   🆕 v3.1.0: чистка следов NocoDB (файлы/задания) +   ║${NC}"
+echo -e "${BLUE}║      честный маркер версии + контроль качества        ║${NC}"
 echo -e "${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -272,15 +274,52 @@ echo -e "${GREEN}✅ Данные и логи очищены${NC}"
 echo ""
 
 # ============================================
-# ШАГ 12: Очистка системных данных NocoDB (комментарии, реакции, уведомления)
+# ШАГ 12: Очистка системных данных NocoDB (комментарии, реакции, уведомления,
+#          ссылки на файлы, история заданий)
 # ============================================
-echo -e "${BLUE}🧹 Шаг 12/12: Очищаю системные данные NocoDB (комментарии, реакции, уведомления)...${NC}"
+echo -e "${BLUE}🧹 Шаг 12/12: Очищаю системные данные NocoDB (комментарии, реакции, файлы, задания)...${NC}"
 
 sqlite3 "$TEMPLATE" "DELETE FROM nc_comments;" 2>/dev/null || true
 sqlite3 "$TEMPLATE" "DELETE FROM nc_comment_reactions;" 2>/dev/null || true
 sqlite3 "$TEMPLATE" "DELETE FROM nc_user_comment_notifications_preference;" 2>/dev/null || true
 
-echo -e "${GREEN}✅ Системные данные NocoDB очищены${NC}"
+# 🆕 v3.1.0: nc_file_references — следы вложений. Данные шаблона и так удаляются,
+# но ссылки на файлы оставались и уезжали в публичный репо: пути содержали
+# base_id ЧУЖОЙ (старой) базы и имена файлов владельца («stamp_LL…», «pixelcut…»).
+# В шаблоне вложений быть не должно — файлы приезжают с данными клиента.
+sqlite3 "$TEMPLATE" "DELETE FROM nc_file_references;" 2>/dev/null || true
+
+# 🆕 v3.1.0: nc_jobs — история экспорта/импорта NocoDB (июнь–август: следы работы
+# с первой базой) вместе с id пользователей, которых в шаблоне уже нет.
+sqlite3 "$TEMPLATE" "DELETE FROM nc_jobs;" 2>/dev/null || true
+
+echo -e "${GREEN}✅ Системные данные NocoDB очищены (комментарии, файлы, задания)${NC}"
+echo ""
+
+# ============================================
+# 🆕 ПОДШАГ 12.5: ЧЕСТНЫЙ МАРКЕР ВЕРСИИ СХЕМЫ (v3.1.0)
+# ============================================
+# Зачем: шаблон содержит ВСЕ фичи (включая последние дельты), а маркер
+# `printed4u_schema_version` оставался тем, что был в живой базе на момент
+# снятия копии (у нас годами стояло «6» при содержимом до U13). install.sh и
+# apply-template.sh ставят версию = максимум дельт, но если шаблон отдадут
+# другим путём (снапшот/рестор/руками) — врёт и пугает «догоном дельт».
+# Теперь маркер выставляется ТУТ, и шаблон всегда согласован с кодом.
+echo -e "${BLUE}🔢 Подшаг 12.5: выставляю маркер версии схемы = максимум дельт...${NC}"
+
+MAX_DELTA=0
+for f in upgrades/U*.sh; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f" | sed -n 's/^U0*\([0-9][0-9]*\)_.*/\1/p')
+    [ -n "$n" ] && [ "$n" -gt "$MAX_DELTA" ] && MAX_DELTA="$n"
+done
+TEMPLATE_ABS="$(realpath "$TEMPLATE" 2>/dev/null || echo "$PWD/$TEMPLATE")"
+if [ "$MAX_DELTA" -gt 0 ]; then
+    NOCO_DB="$TEMPLATE_ABS" bash modules/version.sh set "$MAX_DELTA" || \
+        echo -e "${YELLOW}⚠️  Не удалось записать маркер версии (проверь modules/version.sh)${NC}"
+else
+    echo -e "${YELLOW}⚠️  Дельт в upgrades/ нет — маркер версии не выставлялся${NC}"
+fi
 echo ""
 
 # ============================================
@@ -336,6 +375,36 @@ SELECT COUNT(*) FROM (
 );" 2>/dev/null || echo "0")
 echo "   Дубликатов order в grid views: $ORDER_DUPES_TOTAL"
 
+# 🆕 v3.1.0: контроль следов NocoDB, пустоты бизнес-таблиц и честности маркера версии
+echo ""
+echo -e "${YELLOW}🧾 Проверка следов NocoDB и маркера версии:${NC}"
+FILE_REFS=$(sqlite3 "$TEMPLATE" "SELECT COUNT(*) FROM nc_file_references;" 2>/dev/null || echo "0")
+JOBS=$(sqlite3 "$TEMPLATE" "SELECT COUNT(*) FROM nc_jobs;" 2>/dev/null || echo "0")
+
+DATA_ROWS=0
+while IFS= read -r T; do
+    [ -z "$T" ] && continue
+    CNT=$(sqlite3 "$TEMPLATE" "SELECT COUNT(*) FROM \"$T\";" 2>/dev/null || echo "0")
+    CNT=$(echo "$CNT" | tr -cd '0-9')
+    [ -z "$CNT" ] && CNT=0
+    DATA_ROWS=$((DATA_ROWS + CNT))
+done < <(sqlite3 "$TEMPLATE" "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'nc_nw7q___%';")
+
+FOREIGN_IDS=$(sqlite3 "$TEMPLATE" "
+SELECT
+    (SELECT COUNT(*) FROM nc_columns_v2 WHERE base_id NOT IN (SELECT id FROM nc_bases_v2)) +
+    (SELECT COUNT(*) FROM nc_models_v2  WHERE base_id NOT IN (SELECT id FROM nc_bases_v2)) +
+    (SELECT COUNT(*) FROM nc_views_v2   WHERE base_id NOT IN (SELECT id FROM nc_bases_v2));" 2>/dev/null || echo "0")
+FOREIGN_IDS=$(echo "$FOREIGN_IDS" | tr -cd '0-9'); [ -z "$FOREIGN_IDS" ] && FOREIGN_IDS=0
+
+SCHEMA_MARK=$(sqlite3 "$TEMPLATE" "SELECT COALESCE(value,'0') FROM nc_store WHERE key='printed4u_schema_version' LIMIT 1;" 2>/dev/null || echo "0")
+
+echo "   Ссылки на файлы (nc_file_references): $FILE_REFS"
+echo "   Задания NocoDB (nc_jobs): $JOBS"
+echo "   Строк в бизнес-таблицах (nc_nw7q___*): $DATA_ROWS"
+echo "   Чужие base_id в метаданных: $FOREIGN_IDS"
+echo "   Маркер версии схемы: $SCHEMA_MARK (дельт в коде: $MAX_DELTA)"
+
 echo ""
 echo -e "${YELLOW}⭐ Проверка дефолтных views:${NC}"
 DEFAULT_VIEWS=$(sqlite3 "$TEMPLATE" "SELECT COUNT(*) FROM nc_views_v2 WHERE is_default = 1;")
@@ -364,12 +433,15 @@ SELECT
 
 COMMENTS_TOTAL=$(sqlite3 "$TEMPLATE" "SELECT COUNT(*) FROM nc_comments;" 2>/dev/null || echo "0")
 
-if [ "$ORPHAN_TOTAL" -eq 0 ] && [ "$COMMENTS_TOTAL" -eq 0 ] && [ "$ORDER_DUPES_TOTAL" -eq 0 ] && [ "$DEFAULT_VIEWS" -ge "$TOTAL_GRID_MODELS" ]; then
+if [ "$ORPHAN_TOTAL" -eq 0 ] && [ "$COMMENTS_TOTAL" -eq 0 ] && [ "$ORDER_DUPES_TOTAL" -eq 0 ] && [ "$DEFAULT_VIEWS" -ge "$TOTAL_GRID_MODELS" ] \
+   && [ "$FILE_REFS" -eq 0 ] && [ "$JOBS" -eq 0 ] && [ "$DATA_ROWS" -eq 0 ] && [ "$FOREIGN_IDS" -eq 0 ] && [ "$SCHEMA_MARK" = "$MAX_DELTA" ]; then
     echo -e "${GREEN}╔═══════════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║   ✅ Шаблон template.db ГОТОВ и ЧИСТ!                    ║${NC}"
     echo -e "${GREEN}║   ✅ Комментарии NocoDB удалены                          ║${NC}"
     echo -e "${GREEN}║   ✅ Order нормализован (дубликатов: 0)                  ║${NC}"
     echo -e "${GREEN}║   ✅ is_default установлен ($DEFAULT_VIEWS/$TOTAL_GRID_MODELS)                    ║${NC}"
+    echo -e "${GREEN}║   ✅ Следов NocoDB нет (файлы/задания), данных нет        ║${NC}"
+    echo -e "${GREEN}║   ✅ Маркер версии схемы = U$MAX_DELTA                            ║${NC}"
     echo -e "${GREEN}╚═══════════════════════════════════════════════════════════╝${NC}"
 else
     if [ "$ORPHAN_TOTAL" -gt 0 ]; then
@@ -384,13 +456,28 @@ else
     if [ "$DEFAULT_VIEWS" -lt "$TOTAL_GRID_MODELS" ]; then
         echo -e "${YELLOW}⚠️  Дефолтных views меньше чем моделей: $DEFAULT_VIEWS/$TOTAL_GRID_MODELS${NC}"
     fi
+    if [ "$FILE_REFS" -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  Остались ссылки на файлы: $FILE_REFS (в шаблон не должны попадать)${NC}"
+    fi
+    if [ "$JOBS" -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  Осталась история заданий NocoDB: $JOBS${NC}"
+    fi
+    if [ "$DATA_ROWS" -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  В бизнес-таблицах остались строки: $DATA_ROWS (данные клиента/владельца!)${NC}"
+    fi
+    if [ "$FOREIGN_IDS" -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  Метаданные ссылаются на несуществующую базу: $FOREIGN_IDS записей${NC}"
+    fi
+    if [ "$SCHEMA_MARK" != "$MAX_DELTA" ]; then
+        echo -e "${YELLOW}⚠️  Маркер версии схемы ($SCHEMA_MARK) не совпадает с максимумом дельт ($MAX_DELTA)${NC}"
+    fi
     echo -e "${YELLOW}   Проверьте вручную перед коммитом${NC}"
 fi
 
 echo ""
 echo -e "${BLUE}📤 Следующие шаги:${NC}"
 echo "   git add template.db export-template.sh"
-echo '   git commit -m "🔧 export-template.sh v3.0.3 + нормализация order + is_default + чистый template.db"'
+echo '   git commit -m "🔧 export-template.sh v3.1.0: чистка следов NocoDB (файлы/задания) + маркер версии + новый template.db"'
 echo "   git push origin main"
 echo ""
 echo -e "${YELLOW}💾 Бэкап сохранён: $BACKUP${NC}"

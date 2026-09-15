@@ -315,7 +315,8 @@ function generateDocNumber(dateStr, id) {
     return `${String(d.getFullYear()).slice(-2)}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}-${id}`;
 }
 
-const fmt = (n) => n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+const r2 = (x) => Math.round((Number(x) + 1e-9) * 100) / 100; // v4.66.0: единое округление (half-up до копеек)
+const fmt = (n) => r2(n).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
 
 function renderDocument(doc, project, regularItems, customerMaterials, юрлицо, контакт, менеджер, my, settings, signer) {
     // 📄 ЗАГОЛОВОК И МЕТАДАННЫЕ
@@ -407,7 +408,6 @@ function renderDocument(doc, project, regularItems, customerMaterials, юрли�
     regularItems.forEach((work, idx) => {
         const qty = parseFloat(work['Кол-во']) || 0;
         const price = parseFloat(work['Цена']) || 0;
-        const sumWithoutVAT = qty * price;
         
         let displayName = work['Название'] || '';
         if (!displayName) {
@@ -423,18 +423,27 @@ function renderDocument(doc, project, regularItems, customerMaterials, юрли�
                 
         const unit = work['Ед. изм.'] || work['Ед._изм.'] || '';
         
-        let vatAmount = 0, priceWithoutVat = price, sumWithVat = sumWithoutVAT;
-        
+                // v4.66.0 (Вариант C): округление НА СТРОКЕ (half-up до копеек) и согласование
+        // НДС, чтобы «без НДС + НДС = с НДС» и «Σ строк = Итого» сходились точно.
+        let priceGross = r2(price);
+        let priceWithoutVat, sumWithoutVatR, vatAmount, sumWithVat;
         if (vatType === 'Включен в цену' && vatRate > 0) {
-            vatAmount = sumWithoutVAT * vatRate / (100 + vatRate);
-            priceWithoutVat = price - (vatAmount / (qty || 1));
-            sumWithVat = sumWithoutVAT;
+            sumWithVat = r2(priceGross * qty);
+            priceWithoutVat = r2(priceGross * 100 / (100 + vatRate));
+            sumWithoutVatR = r2(priceWithoutVat * qty);
+            vatAmount = r2(sumWithVat - sumWithoutVatR);
         } else if (vatType === 'Начисляется сверху' && vatRate > 0) {
-            vatAmount = sumWithoutVAT * vatRate / 100;
-            sumWithVat = sumWithoutVAT + vatAmount;
+            priceWithoutVat = priceGross;
+            sumWithoutVatR = r2(priceWithoutVat * qty);
+            vatAmount = r2(sumWithoutVatR * vatRate / 100);
+            sumWithVat = r2(sumWithoutVatR + vatAmount);
+        } else {
+            priceWithoutVat = priceGross;
+            sumWithoutVatR = r2(priceWithoutVat * qty);
+            vatAmount = 0;
+            sumWithVat = sumWithoutVatR;
         }
-        
-        totalSum += (priceWithoutVat * qty);
+        totalSum += sumWithoutVatR;
         totalVAT += vatAmount;
         totalWithVAT += sumWithVat;
         
@@ -445,8 +454,8 @@ function renderDocument(doc, project, regularItems, customerMaterials, юрли�
             <td class="text-center">${unit}</td>
             <td class="text-center">${qty}</td>
             <td class="text-right">${fmt(priceWithoutVat)}</td>
-            <td class="text-right">${fmt(priceWithoutVat * qty)}</td>
-            <td class="text-center">${vatType === 'Без НДС' ? '-' : vatRate + '%'}</td>
+            <td class="text-right">${fmt(sumWithoutVatR)}</td>
+            <td class="text-center">${(vatType === 'Без НДС' || !(vatRate > 0)) ? '-' : vatRate + '%'}</td>
             <td class="text-right">${fmt(vatAmount)}</td>
             <td class="text-right">${fmt(sumWithVat)}</td>
         `;
@@ -557,8 +566,11 @@ function numberToWords(num) {
         if (n > 0) { result += u[n] + ' '; }
         return result.trim();
     }
-    const rubles = Math.floor(num);
-    const kopecks = Math.round((num - rubles) * 100);
+    // v4.66.0: считаем в целых копейках (half-up) с переносом в рубли,
+    // иначе при дробной части >= 0,995 печаталось «100 копеек».
+    const cents = Math.round((Number(num) + 1e-9) * 100);
+    const rubles = Math.floor(cents / 100);
+    const kopecks = cents % 100;
     let result = '';
     if (rubles === 0) { result = 'ноль'; }
     else if (rubles < 1000) { result = convertTriplet(rubles, false); }

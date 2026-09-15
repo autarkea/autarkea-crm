@@ -129,21 +129,38 @@ function listFilesRecursive(dir, prefix = '') {
     return result;
 }
 
-async function calculateProjectTotal(projectId) {
+// v4.66.0 («Вариант C»): суммы документа — ПО СТРОКАМ с тем же округлением, что и
+// PDF-шаблоны (vat.sumItems → round2 на позицию), иначе письмо/бот разойдутся с
+// документом на копейки. Состав позиций — по типу документа (vat.isItemInDocument):
+// счёт — все платные, акт — только «Работа», накладная — «Товар»/«Изделие».
+async function calcDocAmounts(projectId, docType, vatType, vatRate) {
     try {
         const response = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${TABLE_ITEMS}?limit=1000`, { headers: { 'xc-token': NOCO_API_TOKEN } });
-        const items = response.data.list || [];
-        let total = 0;
-        for (const item of items) {
-            // v4.37.0: позиции «Мат. заказчика» исключаем (в документах идут без цен) —
-            // теперь код совпадает с документацией → раздел «Расчёт НДС».
-            if (extractId(item['Проекты']) == projectId && !vat.isCustomerMaterial(item)) total += parseFloat(item['Сумма'] || 0);
-        }
-        return total;
+        const items = (response.data.list || []).filter(item =>
+            extractId(item['Проекты']) == projectId && vat.isItemInDocument(item, docType));
+        return vat.sumItems(items, vatType, vatRate);
     } catch (error) {
-        console.error('Ошибка подсчёта суммы:', error.message);
-        return 0;
+        console.error('Ошибка подсчёта сумм документа:', error.message);
+        return { net: 0, vat: 0, gross: 0, count: 0 };
     }
+}
+
+// v4.65.0: единая проверка настройки НДС перед формированием/отправкой документа.
+// Fail-closed: если тип НДС требует ставку, а ставка пуста (или тип неизвестен) —
+// документ НЕ создаём. Иначе в мир уйдёт документ со ставкой «0%» и нулевым НДС,
+// а «0%» — это отдельный налоговый режим, не «Без НДС». См. shared/vat.js.
+async function requireVatConfigured() {
+    const res = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${process.env.TABLE_MY_DETAILS}?limit=1`, { headers: { 'xc-token': NOCO_API_TOKEN } });
+    const row = (res.data && res.data.list && res.data.list[0]) || null;
+    const check = vat.checkVatConfig(row);
+    if (!check.ok) {
+        const err = new Error('VAT_NOT_CONFIGURED');
+        err.vatMessage = check.message;
+        err.vatCode = check.code;
+        console.log(`⛔ НДС не настроен (${check.code}): документ не формируем`);
+        throw err;
+    }
+    return check;
 }
 
 function getDocTypeName(type) {
@@ -249,6 +266,9 @@ async function generatePDF(docId) {
         if (!docType) throw new Error('NO_DOC_TYPE');
         const htmlFile = DOC_TYPE_MAP[docType];
         if (!htmlFile) throw new Error(`❓ Неизвестный тип документа: "${docType}"`);
+
+        // v4.65.0 (fail-closed): НДС настроен противоречиво → документ не создаём
+        await requireVatConfigured();
 
         const docNumber = generateDocNumber(doc['Дата документа'], docId);
         const withStamp = doc['С печатью'] === true || doc['С печатью'] === 1 || doc['С печатью'] === 'true' || doc['С печатью'] === '1';
@@ -600,6 +620,7 @@ app.get('/', requireSecret, async (req, res) => {
     } catch (error) {
         if (error.message === 'NO_DOC_TYPE') return res.status(400).send(getNoTypeHTML());
         if (error.message === 'NO_PROJECT_LINKED') return res.status(400).send(getNoProjectHTML());
+        if (error.message === 'VAT_NOT_CONFIGURED') return res.status(400).send(getVatConfigHTML(error.vatMessage));
         res.status(500).send(getErrorHTML(error.message));
     }
 });
@@ -807,6 +828,8 @@ app.get('/send-email', requireSecret, async (req, res) => {
     if (!docId) return res.status(400).send(getErrorHTML('Параметр ?docId обязателен', null, 'Откройте документ через NocoDB и нажмите «Отправить по email» снова.'));
 
     try {
+        // v4.65.0 (fail-closed): форма не открывается, пока НДС настроен противоречиво
+        await requireVatConfigured();
         const docRes = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${TABLE_DOCS}/${docId}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
         const doc = docRes.data;
         const docType = doc['Тип документа'];
@@ -826,11 +849,9 @@ app.get('/send-email', requireSecret, async (req, res) => {
             project = projRes.data;
         }
         
-        // 🆕 0. РАСЧЁТ СУММЫ И НДС
-        const baseTotal = await calculateProjectTotal(projectId);
-        let vatAmount = 0;
-        let totalWithVat = baseTotal;
-        
+        // (Суммы и НДС считаются НИЖЕ, после чтения «Мои реквизиты»: для округления
+        //  по строкам нужны тип НДС и ставка — см. calcDocAmounts.)
+
         // 🆕 1. ЗАГРУЗКА МЕНЕДЖЕРА ПРОЕКТА
         let manager = { name: '', email: process.env.SMTP_FROM, phone: '', position: '', company: '', website: '' };
         let managerNotFound = false;
@@ -874,13 +895,15 @@ app.get('/send-email', requireSecret, async (req, res) => {
             }
         } catch (e) { console.log(`⚠️ Не удалось получить "Мои реквизиты": ${e.message}`); }
 
-        // 🆕 РАСЧЁТ НДС (v4.37.0: единый модуль shared/vat.js, тесты tests/vat.test.js)
-        const vatCalc = vat.computeVat(baseTotal, companyDetails.vatRate, companyDetails.vatType);
-        const vatRate = vatCalc.vatRate;
-        const vatType = vatCalc.vatType;
-        vatAmount = vatCalc.vatAmount;
-        totalWithVat = vatCalc.totalWithVat;
-        console.log(`💰 Расчёт НДС: база=${baseTotal}, тип="${vatType}", ставка=${vatRate}%, НДС=${vatAmount}, итого=${totalWithVat}`);
+        // 🆕 РАСЧЁТ СУММ И НДС (v4.66.0 «Вариант C»: округление по строке + состав документа;
+        // единый модуль shared/vat.js, тесты tests/vat.test.js и tests/vat-parity.test.js)
+        const docSums = await calcDocAmounts(projectId, docType, companyDetails.vatType, companyDetails.vatRate);
+        const vatRate = companyDetails.vatRate;
+        const vatType = companyDetails.vatType;
+        const baseTotal = docSums.net;    // без НДС
+        const vatAmount = docSums.vat;    // НДС
+        const totalWithVat = docSums.gross; // с НДС («к оплате»)
+        console.log(`💰 Документ ${docType}: без НДС=${baseTotal}, тип="${vatType}", ставка=${vatRate}%, НДС=${vatAmount}, итого=${totalWithVat}`);
 
         // 🆕 3. FALLBACK: Если менеджер не указан, используем данные компании
         if (managerNotFound || !manager.name) {
@@ -964,6 +987,7 @@ app.get('/send-email', requireSecret, async (req, res) => {
         console.error('❌ Ошибка:', error.message);
         if (error.message === 'NO_PROJECT_LINKED') return res.status(400).send(getNoProjectHTML());
         if (error.message === 'NO_DOC_TYPE') return res.status(400).send(getNoTypeHTML());
+        if (error.message === 'VAT_NOT_CONFIGURED') return res.status(400).send(getVatConfigHTML(error.vatMessage));
         res.status(500).send(getErrorHTML(error.message, docId));
     }
 });
@@ -973,6 +997,8 @@ app.post('/send-email', requireSecret, async (req, res) => {
     if (!docId || !toEmail || !subject || !text || !pdfFileName) return res.status(400).send(getErrorHTML('Заполните все поля', docId));
     
     try {
+        // v4.65.0 (fail-closed): не отправляем документ при противоречивой настройке НДС
+        await requireVatConfigured();
         const docRes = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${TABLE_DOCS}/${docId}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
         const doc = docRes.data;
         const projectId = extractProjectId(doc['Проект']);
@@ -1027,6 +1053,7 @@ app.post('/send-email', requireSecret, async (req, res) => {
         res.send(getEmailSuccessHTML({ docId, docType: doc['Тип документа'], toEmail, pdfFileName, messageId: result.messageId }));
     } catch (error) {
         console.error('❌ Ошибка отправки:', error.message);
+        if (error.message === 'VAT_NOT_CONFIGURED') return res.status(400).send(getVatConfigHTML(error.vatMessage));
         res.status(500).send(getErrorHTML(error.message, docId));
     }
 });
@@ -1082,6 +1109,17 @@ app.post('/api/send-doc', requireSecret, async (req, res) => {
     if (emailSendingDocs.has(docId)) {
         return res.status(409).json({ error: 'Письмо по этому документу уже отправляется — подождите пару секунд' });
     }
+    // v4.65.0 (fail-closed): при противоречивой настройке НДС документ не отправляем.
+    // ВАЖНО: проверка стоит ДО блока ниже — у того try свой catch, который только
+    // пишет предупреждение в лог и продолжает работу (ошибка бы «проглотилась»).
+    // send-doc не генерирует PDF, поэтому проверка нужна своя (не из generatePDF).
+    try {
+        await requireVatConfigured();
+    } catch (e) {
+        if (e.message === 'VAT_NOT_CONFIGURED') return res.status(400).json({ error: e.vatMessage });
+        return res.status(500).json({ error: e.message });
+    }
+
     try {
         const checkRes = await axios.get(`${NOCO_API_URL}/${BASE_ID}/${TABLE_DOCS}/${docId}`, { headers: { 'xc-token': NOCO_API_TOKEN } });
         if (checkRes.data['Статус'] === 'Отправлен') {
@@ -1127,6 +1165,7 @@ app.post('/api/send-doc', requireSecret, async (req, res) => {
         res.json({ success: true, docId, toEmail: prep.toEmail, messageId: result.messageId });
     } catch (error) {
         console.error('❌ Ошибка /api/send-doc:', error.message);
+        if (error.message === 'VAT_NOT_CONFIGURED') return res.status(400).json({ error: error.vatMessage });
         res.status(500).json({ error: error.message });
     } finally {
         emailSendingDocs.delete(docId);
@@ -1144,6 +1183,8 @@ app.post('/generate-pdf', requireSecret, async (req, res) => {
     } catch (e) { 
         if (e.message === 'NO_PROJECT_LINKED') return res.status(400).send(getNoProjectHTML());
         if (e.message === 'NO_DOC_TYPE') return res.status(400).send(getNoTypeHTML());
+        // v4.65.0: бот читает data.error и показывает текст менеджеру (см. generateDocPdfAndSend)
+        if (e.message === 'VAT_NOT_CONFIGURED') return res.status(400).json({ error: e.vatMessage });
         res.status(500).json({ error: e.message }); 
     }
 });
@@ -1165,6 +1206,10 @@ app.get('/generate-pdf', requireSecret, async (req, res) => {
         if (e.message === 'NO_DOC_TYPE') {
             console.log(`⚠️ Документ ID=${id} не имеет типа`);
             return res.status(400).send(getNoTypeHTML());
+        }
+        if (e.message === 'VAT_NOT_CONFIGURED') {
+            console.log(`⛔ Документ ID=${id}: НДС не настроен — генерация заблокирована`);
+            return res.status(400).send(getVatConfigHTML(e.vatMessage));
         }
         console.error(`❌ Ошибка в GET /generate-pdf для ID=${id}:`, e.message);
         res.status(500).send(getErrorHTML(e.message, id));
@@ -1196,17 +1241,20 @@ function getEmailFormHTML({ docId, secret, docType, projectName, pdfFileName, pd
     defaultSubject = escapeHtml(defaultSubject);
     defaultText = escapeHtml(defaultText);
     
-    // 🆕 ФОРМИРОВАНИЕ БЛОКА СУММЫ (зависит от типа НДС)
+    // 🆕 ФОРМИРОВАНИЕ БЛОКА СУММЫ (зависит от типа НДС).
+    // v4.66.0: значения приходят уже округлёнными ПО СТРОКАМ (vat.sumItems) — ровно
+    // как в PDF, поэтому «сумма в письме» = «Итого» в документе. money() — на всякий.
+    const money = (n) => vat.round2(n).toFixed(2);
     let sumBlock = '';
     if (vatType === 'Без НДС' || vatRate === 0) {
-        sumBlock = `<strong>Сумма:</strong> ${baseTotal.toFixed(2)} BYN<br><span style="color: #7f8c8d; font-size: 13px;">Без НДС</span>`;
+        sumBlock = `<strong>Сумма:</strong> ${money(baseTotal)} BYN<br><span style="color: #7f8c8d; font-size: 13px;">Без НДС</span>`;
     } else if (vatType === 'Начисляется сверху') {
-        sumBlock = `<strong>Сумма без НДС:</strong> ${baseTotal.toFixed(2)} BYN<br>
-        <strong>НДС (${vatRate}%):</strong> ${vatAmount.toFixed(2)} BYN<br>
-        <strong style="color: var(--success-color); font-size: 16px;">Итого к оплате: ${totalWithVat.toFixed(2)} BYN</strong>`;
+        sumBlock = `<strong>Сумма без НДС:</strong> ${money(baseTotal)} BYN<br>
+        <strong>НДС (${vatRate}%):</strong> ${money(vatAmount)} BYN<br>
+        <strong style="color: var(--success-color); font-size: 16px;">Итого к оплате: ${money(totalWithVat)} BYN</strong>`;
     } else if (vatType === 'Включен в цену') {
-        sumBlock = `<strong>Сумма:</strong> ${totalWithVat.toFixed(2)} BYN<br>
-        <span style="color: #7f8c8d; font-size: 13px;">В т.ч. НДС (${vatRate}%): ${vatAmount.toFixed(2)} BYN</span>`;
+        sumBlock = `<strong>Сумма:</strong> ${money(totalWithVat)} BYN<br>
+        <span style="color: #7f8c8d; font-size: 13px;">В т.ч. НДС (${vatRate}%): ${money(vatAmount)} BYN</span>`;
     }
 
     return `<!DOCTYPE html>
@@ -1530,6 +1578,24 @@ function getNoTypeHTML() {
 <p style="margin-top: 10px;">Допустимые значения:</p><ul style="margin-left: 20px; margin-top: 5px; line-height: 1.8;">
 <li>📄 <strong>Счет</strong> — счёт-договор</li><li>✅ <strong>Акт</strong> — акт выполненных работ</li><li>📦 <strong>Накладная</strong> или <strong>ТН</strong> — товарная накладная</li></ul></div>
 <a href="javascript:window.close();" class="btn">Закрыть вкладку</a></div></body></html>`;
+}
+
+// v4.65.0: страница «НДС не настроен» — вместо генерации/отправки документа, когда
+// «Тип НДС» требует ставку, а ставка пуста (или тип не из списка). Показываем, что
+// именно заполнить, чтобы менеджер починил за минуту, а не звонил в поддержку.
+function getVatConfigHTML(message) {
+    return `<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>НДС не настроен 🧮</title><link rel="stylesheet" href="/shared-styles.css">
+<style>body { background: var(--warning-gradient); } h1 { color: var(--warning-color); } .info-box { background: #fff3cd; border-left-color: var(--warning-color); } .info-box h3 { color: #856404; } .info-box p, .info-box li { color: #856404; } .info-box code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; font-size: 12px; } .btn { background: var(--warning-color); color: #fff; }</style></head>
+<body><div class="container"><div class="icon">🧮</div><h1>НДС не настроен</h1><p class="subtitle">Документ не сформирован — в нём была бы неверная ставка</p>
+<div class="info-box"><h3>🔍 Что не так</h3><p>${escapeHtml(message || 'Настройки НДС противоречивы.')}</p>
+<h3 style="margin-top: 12px;">💡 Что делать</h3><p>Откройте таблицу <strong>«Мои реквизиты»</strong> и заполните <code>Тип НДС</code> и <code>Ставка НДС</code>:</p>
+<ul style="margin-left: 20px; margin-top: 5px; line-height: 1.8;">
+<li>не платим НДС (УСН) → тип <strong>«Без НДС»</strong>, ставку можно оставить пустой;</li>
+<li>НДС добавляется сверху → тип <strong>«Начисляется сверху»</strong> + ставка (например 20);</li>
+<li>цены уже с НДС → тип <strong>«Включен в цену»</strong> + ставка.</li></ul></div>
+<a href="${NOCO_BASE_URL}/dashboard" target="_blank" class="btn">Открыть NocoDB → «Мои реквизиты»</a>
+<a href="javascript:window.close();" class="btn" style="background:#95a5a6; margin-left:10px;">Закрыть вкладку</a></div></body></html>`;
 }
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Сервер запущен на порту ${PORT}`));

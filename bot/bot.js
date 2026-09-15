@@ -10,6 +10,9 @@ const { matchCallbackBlock, isAdminOnlyCallback, isManagerOnlyCallback, isDocsSe
 const { createNocoClient } = require('./shared/noco');
 const textUtil = require('./shared/text');
 const dates = require('./shared/dates');
+// v4.68.0: «список покупок» для горячих запросов (fields=) — меньше трафика и работы
+// NocoDB на путях, которые выполняются раз в минуту. Сторож: tests/noco-fields.test.js.
+const nocoFields = require('./shared/noco-fields');
 const noco = createNocoClient({ axios, baseUrl: config.NOCO_URL, baseId: config.BASE_ID, token: config.NOCO_TOKEN });
 
 // ================== WEBHOOK (project-webhook, контейнер printed4u-webhook) ==================
@@ -132,7 +135,11 @@ function isEmployeeActive(emp) {
 async function loadAllowedUsers() {
     try {
         const prevCache = new Map(employeesCache);
-        const response = await axios.get(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.EMPLOYEES}?limit=1000`, { headers: { 'xc-token': config.NOCO_TOKEN } });
+        // v4.68.0: fields= — иначе NocoDB отдаёт запись сотрудника со ВСЕМИ связями
+        // (проекты, дела, документы, служебные M2M): 60 788 Б против 1 111 Б на 4 сотрудника,
+        // а запрос идёт РАЗ В МИНУТУ (setInterval ниже). Список полей = ровно то,
+        // что кладётся в кэш; флаг «Отправка документов» — из roles.DOCS_FLAG_FIELD.
+        const response = await axios.get(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.EMPLOYEES}?limit=1000&${nocoFields.fieldsParam(nocoFields.EMPLOYEE_CACHE_FIELDS, [roles.DOCS_FLAG_FIELD])}`, { headers: { 'xc-token': config.NOCO_TOKEN } });
         employeesCache.clear();
         if (response.data && response.data.list) {
             response.data.list.forEach(emp => {
@@ -156,7 +163,9 @@ async function loadAllowedUsers() {
         // Горячий путь (раз в 60 сек): нужны ТОЛЬКО задачи, созданные за последние 2 минуты.
         // sort=-CreatedAt + limit=100 гарантирует их наличие без полной выборки таблицы.
         try {
-            const tasksRes = await axios.get(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.TASKS}?limit=100&sort=-CreatedAt`, { headers: { 'xc-token': config.NOCO_TOKEN } });
+            // v4.68.0: fields= — сверху этого блока читаются только эти поля, а без
+            // параметра NocoDB разворачивает связи задач: 99 025 Б против 14 340 Б.
+            const tasksRes = await axios.get(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.TASKS}?limit=100&sort=-CreatedAt&${nocoFields.fieldsParam(nocoFields.TASK_NOTIFY_FIELDS)}`, { headers: { 'xc-token': config.NOCO_TOKEN } });
             const activeTasks = tasksRes.data.list.filter(t => !t['Готово'] && t['Исполнитель']);
 
             for (const [tgId, emp] of employeesCache.entries()) {
@@ -291,6 +300,8 @@ const STATE = {
     WAITING_DOC_NOTE: 'waiting_doc_note',
     // v4.42.4: ввод суммы поступившей оплаты («💵 Внести оплату»)
     WAITING_PAYMENT_AMOUNT: 'waiting_payment_amount',
+    // v4.65.0: ввод ставки НДС (кнопка «🛠 Задать ставку НДС»)
+    WAITING_VAT_RATE: 'waiting_vat_rate',
     // v4.43.0: ввод нового значения поля карточки контакта/юрлица («✏️ Изменить»)
     WAITING_EDIT_VALUE: 'waiting_edit_value',
     // v4.43.0: поиск юрлица для привязки к контакту («🏢 Привязать юрлицо» в карточке контакта)
@@ -2012,6 +2023,31 @@ bot.on('text', async (msg) => {
         return;
     }
 
+    // ================== НАСТРОЙКА НДС: ввод ставки (v4.65.0) ==================
+    // Тип уже выбран кнопкой (vat_set_top / vat_set_incl). Ставку вводим текстом,
+    // чтобы поддержать не только 20 (например 10 или 7,5).
+    if (sess.state === STATE.WAITING_VAT_RATE) {
+        const draftLabel = (sess.vatDraft && sess.vatDraft.label) || '';
+        const rate = parseFloat(String(text).replace('%', '').replace(',', '.').trim());
+        if (!(rate > 0) || rate > 100) {
+            return bot.sendMessage(chatId, '❌ Введи ставку в процентах, например *20* или *7,5*.', { parse_mode: 'Markdown' });
+        }
+        try {
+            const myId = await getMyDetailsId();
+            if (!myId) throw new Error('строка «Мои реквизиты» не найдена');
+            await axios.patch(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.MY_DETAILS}/${myId}`,
+                { 'Ставка НДС': rate },
+                { headers: { 'xc-token': config.NOCO_TOKEN, 'Content-Type': 'application/json' } });
+            noco.invalidateTable(config.TABLES.MY_DETAILS);
+            resetState(chatId);
+            bot.sendMessage(chatId, `✅ НДС настроен: тип *${escapeMarkdown(draftLabel)}*, ставка *${rate}%*.\nДокументы снова формируются.`, { parse_mode: 'Markdown' });
+        } catch (err) {
+            resetState(chatId);
+            bot.sendMessage(chatId, `❌ Не удалось сохранить ставку НДС: ${err.message}`);
+        }
+        return;
+    }
+
     // ================== СРОК ПРОЕКТА (v4.18.0) ==================
     if (sess.state === STATE.WAITING_PROJECT_DEADLINE) {
         const projectId = sess.projectDraft.deadlineProjectId;
@@ -2657,6 +2693,8 @@ const { handleCallbackBlockA } = require('./handlers/main')({
         sendProjectsList, sendProjectDetails, sendProjectStatusMenu,
         sendProjectTasksList, sendProjectItemsList, sendProjectItemDetails,
         sendProjectDocsList, sendDocCard, sendDocCreateConfirm, generateDocPdfAndSend,
+        // v4.65.0: настройка НДС из бота (только Руководитель)
+        sendVatFixMenu, applyVatTypeChoice,
         todayNocoDate, docTypeKeyboard, sendPaymentMenu, sendArchivedProjects, sendTransferMenu, sendDeadlinePicker,
         // v4.43.0: правка карточек контакта/юрлица + привязка контакта к юрлицу
         sendContactEditMenu, sendLegalEditMenu,
@@ -3794,8 +3832,82 @@ function extractLinkId(field) {
     return field ?? null;
 }
 
+// ================== НДС: настройка и её проверка (v4.65.0) ==================
+// «Мои реквизиты» → вердикт fail-closed (shared/vat.js). Прямой GET ?limit=1 без
+// offset — связка limit+offset на этой таблице в NocoDB 2026.08.0 даёт 422.
+// Нет строки/ошибка чтения → «Без НДС» (штатный режим УСН): свежая установка и
+// временная недоступность API не должны блокировать работу (документы и так не
+// соберутся без API).
+async function getVatSettings() {
+    let row = null;
+    try {
+        if (config.TABLES.MY_DETAILS) {
+            const mdRes = await axios.get(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.MY_DETAILS}?limit=1`, { headers: { 'xc-token': config.NOCO_TOKEN } });
+            row = (mdRes.data && mdRes.data.list && mdRes.data.list[0]) || null;
+        }
+    } catch (e) {
+        console.log(`⚠️ НДС: «Мои реквизиты» недоступны, считаем «Без НДС»: ${e.message}`);
+    }
+    return vat.checkVatConfig(row);
+}
+
+// Id единственной строки «Мои реквизиты» — нужен для PATCH (кнопка «Задать ставку НДС»).
+async function getMyDetailsId() {
+    const mdRes = await axios.get(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.MY_DETAILS}?limit=1`, { headers: { 'xc-token': config.NOCO_TOKEN } });
+    const row = (mdRes.data && mdRes.data.list && mdRes.data.list[0]) || null;
+    return row ? row.Id : null;
+}
+
+// Кнопка починки НДС — только Руководителю (это настройка компании, не проекта).
+// В приватном чате chatId === telegram id сотрудника (как и везде в боте).
+function vatFixRows(chatId) {
+    const emp = getEmployee(chatId);
+    return roles.isAdminRole(emp) ? [[{ text: '🛠 Задать ставку НДС', callback_data: 'vat_fix' }]] : [];
+}
+
+// Выбор режима НДС из меню «🛠 Задать ставку НДС». Пишем «Тип НДС» сразу; для типов
+// с налогом переводим чат в ожидание ставки (WAITING_VAT_RATE → её введёт текстом).
+async function applyVatTypeChoice(chatId, key) {
+    const map = {
+        none: { type: vat.VAT_NONE, label: 'Без НДС (УСН)' },
+        top: { type: vat.VAT_ON_TOP, label: 'Начисляется сверху' },
+        incl: { type: vat.VAT_INCLUDED, label: 'Включен в цену' }
+    };
+    const chosen = map[key];
+    if (!chosen) return;
+    const myId = await getMyDetailsId();
+    if (!myId) throw new Error('строка «Мои реквизиты» не найдена');
+    await axios.patch(`${config.NOCO_URL}/api/v1/db/data/noco/${config.BASE_ID}/${config.TABLES.MY_DETAILS}/${myId}`,
+        { 'Тип НДС': chosen.type },
+        { headers: { 'xc-token': config.NOCO_TOKEN, 'Content-Type': 'application/json' } });
+    noco.invalidateTable(config.TABLES.MY_DETAILS);
+    if (chosen.type === vat.VAT_NONE) {
+        resetState(chatId);
+        await bot.sendMessage(chatId, '✅ НДС: *Без НДС* (УСН). Документы формируются без НДС.', { parse_mode: 'Markdown' });
+        return;
+    }
+    const sess = getSession(sessions, chatId);
+    sess.state = STATE.WAITING_VAT_RATE;
+    sess.vatDraft = { label: chosen.label };
+    await bot.sendMessage(chatId, `➕ Тип НДС: *${chosen.label}*.\n\nВведи ставку НДС в процентах — например *20* или *7,5*:`, { parse_mode: 'Markdown' });
+}
+
+// Меню настройки НДС (первый шаг). Для типов с налогом дальше спросим ставку.
+async function sendVatFixMenu(chatId, messageId) {
+    const text = '🧮 *Настройка НДС*\n\nВыбери режим — от него зависит, что вводить в «Цену» позиции:';
+    const inline_keyboard = [
+        [{ text: '🚫 Без НДС (УСН)', callback_data: 'vat_set_none' }],
+        [{ text: '➕ Начисляется сверху', callback_data: 'vat_set_top' }],
+        [{ text: '🟰 Включен в цену', callback_data: 'vat_set_incl' }],
+        [{ text: '❌ Отмена', callback_data: 'vat_cancel' }]
+    ];
+    const options = { parse_mode: 'Markdown', reply_markup: { inline_keyboard } };
+    if (messageId) await editMessageIgnoreSame(text, { chat_id: chatId, message_id: messageId, ...options });
+    else await bot.sendMessage(chatId, text, options);
+}
+
 // 🆕 v4.17.0: Сводка по проекту — задачи (всего/выполнено/просрочено) и позиции заказа (кол-во, сумма).
-// Паттерн как в server.js `calculateProjectTotal` — связи фильтруем в коде (API не умеет).
+// Паттерн как в server.js `calcDocAmounts` — связи фильтруем в коде (API не умеет).
 // 🆕 v4.37.0: позиции «Мат. заказчика» исключаются из счёта и суммы (как в документах —
 // они идут отдельной таблицей без цен); НДС считается единым модулем shared/vat.js
 // по «Мои реквизиты» (ставка + тип), как в форме отправки email.
@@ -3825,27 +3937,35 @@ async function getProjectSummary(projectId) {
             if (t['Готово']) { tasksDone++; continue; }
             if (t['Когда делаем'] && new Date(t['Когда делаем']).getTime() < now) tasksOverdue++;
         }
-        let itemsCount = 0, itemsTotal = 0;
-        for (const it of items) {
-            if (extractLinkId(it['Проекты']) != projectId) continue;
-            if (vat.isCustomerMaterial(it)) continue; // материалы заказчика — не платные позиции
-            itemsCount++;
-            const s = parseFloat(String(it['Сумма']).replace(',', '.'));
-            if (!isNaN(s)) itemsTotal += s;
-        }
         const my = (myDetailsRows && myDetailsRows[0]) || {};
-        const vatCalc = vat.computeVat(itemsTotal, my['Ставка НДС'], my['Тип НДС']);
+        // v4.65.0: сначала проверяем настройку НДС (shared/vat.js). Если она
+        // противоречива — интерфейс НЕ показывает цифры (они были бы ложными),
+        // а документы блокируются в server.js (fail-closed).
+        const vatCheck = vat.checkVatConfig(my);
+        // v4.66.0 («Вариант C»): суммы считаем ПО СТРОКАМ с тем же округлением,
+        // что и PDF-шаблоны (round2 на позицию, итоги — сумма строк), иначе
+        // «сумма в боте» разойдётся с документом на копейки.
+        const projectItems = items.filter(it => extractLinkId(it['Проекты']) == projectId);
+        const sums = vat.sumItems(projectItems, vatCheck.vatType, vatCheck.vatRate);
+        // itemsTotal — сумма, которую видит менеджер: при «Включен в цену» это сумма
+        // С НДС (как он её и вводил), иначе — без НДС; itemsTotalWithVat — «к оплате».
+        const isVatIncl = vatCheck.vatType === vat.VAT_INCLUDED && vatCheck.vatRate > 0;
+        const itemsTotal = isVatIncl ? sums.gross : sums.net;
         return {
             tasksTotal, tasksDone, tasksOverdue,
-            itemsCount, itemsTotal, // itemsTotal — база БЕЗ НДС
-            vatRate: vatCalc.vatRate,
-            vatType: vatCalc.vatType,
-            vatAmount: vatCalc.vatAmount,
-            itemsTotalWithVat: vatCalc.totalWithVat
+            itemsCount: sums.count,
+            itemsTotal,
+            itemsNet: sums.net,
+            itemsGross: sums.gross,
+            vatRate: vatCheck.vatRate,
+            vatType: vatCheck.vatType,
+            vatAmount: sums.vat,
+            itemsTotalWithVat: sums.gross,
+            vatError: vatCheck.ok ? null : { code: vatCheck.code, message: vatCheck.message }
         };
     } catch (err) {
         console.error('Ошибка сводки проекта:', err.message);
-        return { tasksTotal: 0, tasksDone: 0, tasksOverdue: 0, itemsCount: 0, itemsTotal: 0, vatRate: 0, vatType: vat.VAT_NONE, vatAmount: 0, itemsTotalWithVat: 0 };
+        return { tasksTotal: 0, tasksDone: 0, tasksOverdue: 0, itemsCount: 0, itemsTotal: 0, itemsNet: 0, itemsGross: 0, vatRate: 0, vatType: vat.VAT_NONE, vatAmount: 0, itemsTotalWithVat: 0, vatError: null };
     }
 }
 
@@ -3936,9 +4056,15 @@ async function sendProjectDetails(chatId, messageId, projectId, role, telegramId
             sumParts.push(taskPart);
         }
         if (summary.itemsCount > 0) {
-            // v4.37.0: сумма позиций — база БЕЗ НДС; для «Начисляется сверху» и «Включен в цену»
+            // v4.37.0: сумма позиций — база; для «Начисляется сверху» и «Включен в цену»
             // показываем разбивку по «Мои реквизиты» (ставка/тип), как в документах и email.
+            // v4.65.0: если НДС настроен противоречиво — цифр не показываем вовсе.
             const fmtMoney = (n) => n.toFixed(2).replace(/\.00$/, '').replace('.', ',');
+            if (summary.vatError) {
+                sumParts.push(`💰 *Позиции:* ${summary.itemsCount} шт`);
+                sumParts.push(`⚠️ *НДС не настроен:* ${escapeMarkdown(summary.vatError.message)}`);
+                sumParts.push('   🚫 Документы не формируются — исправьте в NocoDB → «Мои реквизиты».');
+            } else {
             const baseStr = fmtMoney(summary.itemsTotal);
             const isVatOnTop = summary.vatType === vat.VAT_ON_TOP && summary.vatRate > 0;
             const isVatIncluded = summary.vatType === vat.VAT_INCLUDED && summary.vatRate > 0;
@@ -3951,6 +4077,7 @@ async function sendProjectDetails(chatId, messageId, projectId, role, telegramId
                 sumParts.push(`   _В т.ч. НДС (${summary.vatRate}%):_ ${fmtMoney(summary.vatAmount)} BYN`);
             } else {
                 sumParts.push(`💰 *Позиции:* ${summary.itemsCount} шт, сумма ${baseStr} BYN`);
+            }
             }
         }
         if (sumParts.length > 0) text += `\n${sumParts.join('\n')}\n`;
@@ -4009,6 +4136,8 @@ async function sendProjectDetails(chatId, messageId, projectId, role, telegramId
             inlineKeyboard.push(actions.slice(i, i + 2));
         }
     }
+    // v4.65.0: НДС настроен противоречиво — даём Руководителю починить прямо отсюда
+    if (summary.vatError) inlineKeyboard.push(...vatFixRows(telegramId));
     inlineKeyboard.push([{ text: '⬅️ Назад', callback_data: backTo || 'pcard_back' }]);
 
     const options = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inlineKeyboard } };
@@ -4144,8 +4273,13 @@ async function sendProjectItemsList(chatId, messageId, projectId) {
         const projName = project ? cleanButtonText(project['Что делаем?'] || `#${projectId}`, 45) : `#${projectId}`;
         let text = `📝 *Позиции заказа* — «${escapeMarkdown(projName)}» (#${projectId})\n`;
 
-        // Итог (база/НДС) — единый расчёт getProjectSummary (та же разбивка, что в карточке)
+        // Итог (база/НДС) — единый расчёт getProjectSummary (та же разбивка, что в карточке).
+        // v4.65.0: при противоречивой настройке НДС цифры НЕ показываем (они ложные).
         const summary = await getProjectSummary(projectId);
+        if (summary.vatError) {
+            text += `⚠️ *НДС не настроен:* ${escapeMarkdown(summary.vatError.message)}\n`;
+            text += `🚫 Документы не формируются — исправьте в NocoDB → «Мои реквизиты».\n`;
+        } else {
         const isVatOnTop = summary.vatType === vat.VAT_ON_TOP && summary.vatRate > 0;
         const isVatIncluded = summary.vatType === vat.VAT_INCLUDED && summary.vatRate > 0;
         if (isVatOnTop) {
@@ -4156,6 +4290,7 @@ async function sendProjectItemsList(chatId, messageId, projectId) {
             text += `💰 *Итого:* ${fmtMoney(summary.itemsTotal)} BYN (в т.ч. НДС ${summary.vatRate}%: ${fmtMoney(summary.vatAmount)} BYN)\n`;
         } else {
             text += `💰 *Итого:* ${fmtMoney(summary.itemsTotal)} BYN (без НДС)\n`;
+        }
         }
 
         const inlineKeyboard = [];
@@ -4187,6 +4322,7 @@ async function sendProjectItemsList(chatId, messageId, projectId) {
         text += `\n🧮 Суммы пересчитываются автоматически.`;
 
         inlineKeyboard.push([{ text: '➕ Добавить позицию', callback_data: `pitem_new_${projectId}` }]);
+        if (summary.vatError) inlineKeyboard.push(...vatFixRows(chatId));
         inlineKeyboard.push([{ text: '⬅️ В карточку проекта', callback_data: `pcard_${projectId}` }]);
 
         const options = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inlineKeyboard } };
@@ -4230,7 +4366,11 @@ async function sendPaymentMenu(chatId, messageId, projectId) {
         const projName = p['Что делаем?'] ? cleanButtonText(p['Что делаем?'], 45) : `#${projectId}`;
 
         let text = `💵 *Оплаты* — «${escapeMarkdown(projName)}» (#${projectId})\n`;
-        if (summary.itemsTotalWithVat > 0) {
+        if (summary.vatError) {
+            // v4.65.0: без корректного НДС «к оплате» посчитать нельзя — не врём цифрой
+            text += `⚠️ *НДС не настроен:* ${escapeMarkdown(summary.vatError.message)}\n`;
+            text += `🚫 К оплате не считаем — исправьте «Мои реквизиты» в NocoDB.\n`;
+        } else if (summary.itemsTotalWithVat > 0) {
             text += `💰 К оплате (позиции с НДС): *${fmtMoney(summary.itemsTotalWithVat)} BYN*\n`;
         } else {
             text += `💰 Позиций с суммой пока нет — к оплате 0 BYN\n`;
@@ -4239,9 +4379,10 @@ async function sendPaymentMenu(chatId, messageId, projectId) {
         text += `🏷 По деньгам?: ${p['По деньгам?'] ? escapeMarkdown(String(p['По деньгам?'])) : '—'}`;
 
         const inlineKeyboard = [
-            [{ text: '💵 Внести оплату', callback_data: `pay_add_${projectId}` }],
-            [{ text: '⬅️ В карточку проекта', callback_data: `pcard_${projectId}` }]
+            [{ text: '💵 Внести оплату', callback_data: `pay_add_${projectId}` }]
         ];
+        if (summary.vatError) inlineKeyboard.push(...vatFixRows(chatId));
+        inlineKeyboard.push([{ text: '⬅️ В карточку проекта', callback_data: `pcard_${projectId}` }]);
         const options = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inlineKeyboard } };
         if (messageId) await editMessageIgnoreSame(text, { chat_id: chatId, message_id: messageId, ...options });
         else await bot.sendMessage(chatId, text, options);
@@ -4335,14 +4476,24 @@ async function sendDocCard(chatId, messageId, docId, projectId, canSend = false)
         text += d['PDF сгенерирован'] ? '📎 PDF сформирован\n' : '📎 PDF ещё не формировался\n';
         if (d['Примечания']) text += `\n📌 ${escapeMarkdown(cleanButtonText(String(d['Примечания']), 200))}`;
 
-        const inlineKeyboard = [
-            [{ text: d['PDF сгенерирован'] ? '📎 Получить PDF' : '🖨 Сформировать PDF', callback_data: `docs_pdf_${docId}_${projectId}` }]
-        ];
+        // v4.65.0 (fail-closed): при противоречивой настройке НДС сервер не сформирует
+        // и не отправит документ — не даём «тапнуть в пустоту», объясняем причину.
+        const vatCheck = await getVatSettings();
+        const vatBlocked = !vatCheck.ok;
+
+        const inlineKeyboard = [];
+        if (vatBlocked) {
+            text += `\n\n⚠️ *НДС не настроен* — документы заблокированы.\n${escapeMarkdown(vatCheck.message)}`;
+        } else {
+            inlineKeyboard.push([{ text: d['PDF сгенерирован'] ? '📎 Получить PDF' : '🖨 Сформировать PDF', callback_data: `docs_pdf_${docId}_${projectId}` }]);
+        }
         // v4.42.3: «выстрел наружу» — только с флагом canSendDocuments (guard центрально).
         // v4.42.5: уже отправленный документ повторно «наружу» не шлём (защита от дублей) —
         // кнопки email/ручной передачи скрываются, остаётся только заметка об отправке.
         const alreadySent = d['Статус'] === 'Отправлен';
-        if (canSend && alreadySent) {
+        if (vatBlocked) {
+            // генерация и отправка недоступны, пока не починят «Мои реквизиты»
+        } else if (canSend && alreadySent) {
             const sentDate = d['Дата отправки'] ? ` ${String(d['Дата отправки']).slice(0, 10)}` : '';
             text += `\n\n✅ Документ уже отправлен${sentDate}. Клиенту он пришёл — повторную рассылку не делаем.`;
         } else if (canSend) {
@@ -4356,6 +4507,7 @@ async function sendDocCard(chatId, messageId, docId, projectId, canSend = false)
             }
             inlineKeyboard.push([{ text: '📤 Отправил вручную (мессенджер/на руки)', callback_data: `docs_manual_${docId}_${projectId}` }]);
         }
+        if (vatBlocked) inlineKeyboard.push(...vatFixRows(chatId));
         inlineKeyboard.push([{ text: '⬅️ К документам', callback_data: `docs_list_${projectId}` }]);
         const options = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inlineKeyboard } };
         if (messageId) await editMessageIgnoreSame(text, { chat_id: chatId, message_id: messageId, ...options });
@@ -4403,8 +4555,11 @@ async function generateDocPdfAndSend(chatId, docId) {
         try { await bot.deleteMessage(chatId, statusMsg.message_id); } catch (e) { /* ignore */ }
         noco.invalidateTable(config.TABLES.DOCUMENTS);
     } catch (err) {
-        console.error('Ошибка генерации PDF:', err.message);
-        try { await bot.editMessageText(`❌ ${err.message}`, { chat_id: chatId, message_id: statusMsg.message_id }); } catch (e) { bot.sendMessage(chatId, `❌ ${err.message}`).catch(() => {}); }
+        // v4.65.0: сервер отдаёт человеческий текст (например «НДС не настроен») в
+        // data.error — показываем его, а не «Request failed with status code 400».
+        const apiMsg = (err && err.response && err.response.data && err.response.data.error) || err.message;
+        console.error('Ошибка генерации PDF:', apiMsg);
+        try { await bot.editMessageText(`❌ ${apiMsg}`, { chat_id: chatId, message_id: statusMsg.message_id }); } catch (e) { bot.sendMessage(chatId, `❌ ${apiMsg}`).catch(() => {}); }
     }
 }
 

@@ -304,6 +304,144 @@ fi
 echo ""
 
 # ============================================
+# 13. НДС: НАСТРОЙКА ДОКУМЕНТОВ (v4.65.0)
+# ============================================
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}🧮 13. НДС: НАСТРОЙКА ДОКУМЕНТОВ${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+
+VAT_TABLE=$(sudo sqlite3 "$DB_PATH" "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%Мои реквизиты';" 2>/dev/null | head -1)
+if [ -n "$VAT_TABLE" ]; then
+    VAT_TYPE=$(sudo sqlite3 "$DB_PATH" "SELECT COALESCE(\"Тип НДС\",'') FROM \"$VAT_TABLE\" LIMIT 1;" 2>/dev/null)
+    VAT_RATE=$(sudo sqlite3 "$DB_PATH" "SELECT COALESCE(\"Ставка НДС\",'') FROM \"$VAT_TABLE\" LIMIT 1;" 2>/dev/null)
+    [ -z "$VAT_TYPE" ] && VAT_TYPE="Без НДС"
+    VAT_RATE_NUM=$(echo "$VAT_RATE" | tr ',' '.' | tr -cd '0-9.')
+    echo "   Тип НДС: \"$VAT_TYPE\" | Ставка НДС: ${VAT_RATE:-не заполнена}"
+    case "$VAT_TYPE" in
+        "Без НДС")
+            echo -e "  ${GREEN}✅ Документы формируются без НДС (УСН)${NC}" ;;
+        "Начисляется сверху"|"Включен в цену")
+            if [ -n "$VAT_RATE_NUM" ] && awk "BEGIN{exit !($VAT_RATE_NUM > 0)}"; then
+                echo -e "  ${GREEN}✅ Ставка заполнена — документы формируются${NC}"
+            else
+                echo -e "  ${RED}❌ Тип НДС задан, а ставка не заполнена → генерация и отправка документов ЗАБЛОКИРОВАНЫ${NC}"
+                echo -e "  ${YELLOW}   В документе была бы ставка «0%» и нулевой НДС — это НЕ то же, что «Без НДС».${NC}"
+                echo -e "  ${YELLOW}   Исправь: NocoDB → «Мои реквизиты» → «Ставка НДС» (например 20)${NC}"
+                echo -e "  ${YELLOW}   или в боте кнопка «🛠 Задать ставку НДС».${NC}"
+            fi ;;
+        *)
+            echo -e "  ${RED}❌ Неизвестный «Тип НДС»: \"$VAT_TYPE\" → генерация документов ЗАБЛОКИРОВАНА${NC}"
+            echo -e "  ${YELLOW}   Допустимо: «Без НДС», «Начисляется сверху», «Включен в цену».${NC}" ;;
+    esac
+else
+    echo -e "  ${YELLOW}⚠️  Таблица «Мои реквизиты» не найдена — настройка НДС не проверена${NC}"
+fi
+echo ""
+
+# ============================================
+# 14. ПОРЯДОК В СХЕМЕ (ОТК, v4.68.0)
+# ============================================
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}🧹 14. ПОРЯДОК В СХЕМЕ (ОТК)${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "   ${YELLOW}Проверка «мусора» в метаданных: дубли имён, порванные связи,${NC}"
+echo -e "   ${YELLOW}осиротевшие M2M-таблицы, имена-опечатки («Делаs»). Только чтение.${NC}"
+
+if [ ! -f "$DB_PATH" ]; then
+    echo -e "  ${YELLOW}⚠️  База не найдена: $DB_PATH — проверка пропущена${NC}"
+else
+    SCHEMA_ISSUES=0
+
+    # 14.1 Дубли названий колонок внутри таблицы (NocoDB такую схему не примет)
+    DUP_COLS=$(sudo sqlite3 "$DB_PATH" "SELECT mo.title || ' → ' || c.title || ' ×' || COUNT(*) FROM nc_columns_v2 c JOIN nc_models_v2 mo ON mo.id = c.fk_model_id GROUP BY c.fk_model_id, c.title HAVING COUNT(*) > 1 LIMIT 5;" 2>/dev/null || echo "")
+    if [ -n "$DUP_COLS" ]; then
+        SCHEMA_ISSUES=$((SCHEMA_ISSUES + 1))
+        echo -e "  ${RED}❌ Дубли названий колонок в одной таблице:${NC}"
+        echo "$DUP_COLS" | sed 's/^/     • /'
+        echo -e "  ${YELLOW}   Лечение: переименовать одну из колонок вручную в NocoDB UI.${NC}"
+    else
+        echo -e "  ${GREEN}✅ Дублей названий колонок нет${NC}"
+    fi
+
+    # 14.2 Битые связи: link-колонка без записи в nc_col_relations_v2
+    NO_REL=$(sudo sqlite3 "$DB_PATH" "SELECT mo.title || '.' || c.title FROM nc_columns_v2 c JOIN nc_models_v2 mo ON mo.id = c.fk_model_id WHERE c.uidt = 'LinkToAnotherRecord' AND c.id NOT IN (SELECT fk_column_id FROM nc_col_relations_v2) LIMIT 5;" 2>/dev/null || echo "")
+    if [ -n "$NO_REL" ]; then
+        SCHEMA_ISSUES=$((SCHEMA_ISSUES + 1))
+        echo -e "  ${RED}❌ Связи без описания (в UI поле «мертво»):${NC}"
+        echo "$NO_REL" | sed 's/^/     • /'
+        echo -e "  ${YELLOW}   Лечение: удалить поле в UI и создать связь заново (или восстановить связь из бэкапа).${NC}"
+    else
+        echo -e "  ${GREEN}✅ Все связи описаны (link → relation)${NC}"
+    fi
+
+    # 14.3 Таблицы-сироты: физическая M2M-таблица без модели/связи (мусор)
+    ORPHAN_M2M=$(sudo sqlite3 "$DB_PATH" "SELECT s.name FROM sqlite_master s WHERE s.type = 'table' AND s.name LIKE '%nc_m2m%' AND NOT EXISTS (SELECT 1 FROM nc_models_v2 m JOIN nc_col_relations_v2 r ON r.fk_mm_model_id = m.id WHERE m.table_name = s.name) LIMIT 5;" 2>/dev/null || echo "")
+    if [ -n "$ORPHAN_M2M" ]; then
+        SCHEMA_ISSUES=$((SCHEMA_ISSUES + 1))
+        echo -e "  ${YELLOW}⚠️  M2M-таблицы без связи (мусор от удалённых связей):${NC}"
+        echo "$ORPHAN_M2M" | sed 's/^/     • /'
+        echo -e "  ${YELLOW}   Данные этих таблиц ничего не показывают; удаление — только с бэкапом и владельцем.${NC}"
+    else
+        echo -e "  ${GREEN}✅ Служебных M2M-таблиц без связи нет${NC}"
+    fi
+
+    # 14.4 «Мусорные» колонки: soft-deleted, пустые названия, пробелы по краям
+    JUNK_COLS=$(sudo sqlite3 "$DB_PATH" "SELECT (SELECT COUNT(*) FROM nc_columns_v2 WHERE deleted = 1) || '|' || (SELECT COUNT(*) FROM nc_models_v2 WHERE deleted = 1) || '|' || (SELECT COUNT(*) FROM nc_columns_v2 WHERE title IS NULL OR TRIM(title) = '' OR title <> TRIM(title));" 2>/dev/null || echo "")
+    JUNK_DEL_COLS=$(echo "$JUNK_COLS" | cut -d'|' -f1)
+    JUNK_DEL_MODELS=$(echo "$JUNK_COLS" | cut -d'|' -f2)
+    JUNK_BAD_TITLES=$(echo "$JUNK_COLS" | cut -d'|' -f3)
+    if [ "${JUNK_DEL_COLS:-0}" != "0" ] || [ "${JUNK_DEL_MODELS:-0}" != "0" ] || [ "${JUNK_BAD_TITLES:-0}" != "0" ]; then
+        SCHEMA_ISSUES=$((SCHEMA_ISSUES + 1))
+        echo -e "  ${YELLOW}⚠️  Удалённых (soft-delete) колонок: ${JUNK_DEL_COLS}, таблиц: ${JUNK_DEL_MODELS}; кривых названий: ${JUNK_BAD_TITLES}${NC}"
+    else
+        echo -e "  ${GREEN}✅ Удалённых и криво названных колонок нет${NC}"
+    fi
+
+    # 14.5 Имена-артефакты: plural = singular + «s» («Делаs», «Проектыs») — у видимых связей
+    ARTIFACTS=$(sudo sqlite3 "$DB_PATH" "SELECT mo.title || '.' || c.title || ' («' || json_extract(c.meta, '\$.plural') || '»)' FROM nc_columns_v2 c JOIN nc_models_v2 mo ON mo.id = c.fk_model_id WHERE c.uidt = 'LinkToAnotherRecord' AND c.title NOT LIKE 'nc\_%' ESCAPE '\' AND c.meta IS NOT NULL AND json_valid(c.meta) AND json_extract(c.meta, '\$.plural') = json_extract(c.meta, '\$.singular') || 's' LIMIT 5;" 2>/dev/null || echo "")
+    if [ -n "$ARTIFACTS" ]; then
+        SCHEMA_ISSUES=$((SCHEMA_ISSUES + 1))
+        echo -e "  ${YELLOW}⚠️  Подписи связей с мусорным «s» (артефакт автогенерации):${NC}"
+        echo "$ARTIFACTS" | sed 's/^/     • /'
+        echo -e "  ${YELLOW}   Лечение: bash $INSTALL_DIR/upgrade.sh — дельты U012 (связи наших модулей) и U014 (связи, созданные в UI) чинят это сами; артефакт, появившийся ПОСЛЕ них, лечится точечно: bash upgrades/U014_podpisi-svyazey-iz-ui.sh.${NC}"
+    else
+        echo -e "  ${GREEN}✅ Имён-артефактов («Делаs» и подобных) нет${NC}"
+    fi
+
+    # 14.6 Дубли order: модели и grid-виды (класс Проблемы 69 — ломало UI)
+    ORDER_DUPES=$(sudo sqlite3 "$DB_PATH" "SELECT 'модель: order ' || \"order\" || ' ×' || COUNT(*) FROM nc_models_v2 GROUP BY \"order\" HAVING COUNT(*) > 1 UNION ALL SELECT 'вид «' || v.title || '»: order ' || g.\"order\" || ' ×' || COUNT(*) FROM nc_grid_view_columns_v2 g JOIN nc_views_v2 v ON v.id = g.fk_view_id WHERE g.\"order\" IS NOT NULL GROUP BY g.fk_view_id, g.\"order\" HAVING COUNT(*) > 1 LIMIT 5;" 2>/dev/null || echo "")
+    if [ -n "$ORDER_DUPES" ]; then
+        SCHEMA_ISSUES=$((SCHEMA_ISSUES + 1))
+        echo -e "  ${YELLOW}⚠️  Дубли порядка (order) — NocoDB UI это не любит:${NC}"
+        echo "$ORDER_DUPES" | sed 's/^/     • /'
+        echo -e "  ${YELLOW}   Лечение: bash $INSTALL_DIR/upgrade.sh — дельта U015 нормализует order (сначала на копии базы); вручную можно перетащить колонку в виде мышью.${NC}"
+    else
+        echo -e "  ${GREEN}✅ Дублей порядка (order) нет${NC}"
+    fi
+
+    # 14.7 Следы ПЕРВОЙ базы: метаданные/файлы ссылаются на базу, которой нет
+    FOREIGN_BASE=$(sudo sqlite3 "$DB_PATH" "SELECT 'колонки: ' || COUNT(*) FROM nc_columns_v2 WHERE base_id NOT IN (SELECT id FROM nc_bases_v2) UNION ALL SELECT 'таблицы: ' || COUNT(*) FROM nc_models_v2 WHERE base_id NOT IN (SELECT id FROM nc_bases_v2) UNION ALL SELECT 'виды: ' || COUNT(*) FROM nc_views_v2 WHERE base_id NOT IN (SELECT id FROM nc_bases_v2) UNION ALL SELECT 'файлы чужой базы: ' || COUNT(*) FROM nc_file_references f WHERE f.file_url LIKE 'download/noco/%' AND f.file_url NOT LIKE '%/' || (SELECT id FROM nc_bases_v2 LIMIT 1) || '/%';" 2>/dev/null | grep -v ': 0$' || echo "")
+    if [ -n "$FOREIGN_BASE" ]; then
+        SCHEMA_ISSUES=$((SCHEMA_ISSUES + 1))
+        echo -e "  ${YELLOW}⚠️  Следы другой (удалённой) базы — обычно от самой первой версии:${NC}"
+        echo "$FOREIGN_BASE" | sed 's/^/     • /'
+        echo -e "  ${YELLOW}   Лечение: работающей базе это не мешает; в ШАБЛОН такие строки не попадут —${NC}"
+        echo -e "  ${YELLOW}   export-template.sh v3.1.0 чистит nc_file_references и nc_jobs сам.${NC}"
+    else
+        echo -e "  ${GREEN}✅ Следов другой базы нет${NC}"
+    fi
+
+    echo ""
+    if [ "$SCHEMA_ISSUES" -eq 0 ]; then
+        echo -e "  ${GREEN}✅ Порядок в схеме: чисто (проверок: 7)${NC}"
+    else
+        echo -e "  ${YELLOW}⚠️  Найдено замечаний: $SCHEMA_ISSUES из 7. Резервная копия — перед любыми правками.${NC}"
+        echo -e "  ${YELLOW}   Что можно сделать самому: bash $INSTALL_DIR/upgrade.sh (идемпотентно, с бэкапом).${NC}"
+    fi
+fi
+echo ""
+
+# ============================================
 # ИТОГ
 # ============================================
 echo -e "${BLUE}╔═══════════════════════════════════════════════════════════╗${NC}"
@@ -314,4 +452,5 @@ echo -e "${YELLOW}💡 Быстрые решения:${NC}"
 echo "   • Если API не отвечает (401/000) → bash $INSTALL_DIR/setup-bot.sh"
 echo "   • Если таблицы не видны → проверь fk_workspace_id в базе"
 echo "   • Если webhook не работает → проверь логи: sudo docker logs printed4u-webhook"
+echo "   • Если документы не формируются при «Тип НДС» с налогом → заполни «Ставка НДС» (раздел 13)"
 echo ""

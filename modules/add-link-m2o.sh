@@ -1,5 +1,5 @@
 #!/bin/bash
-# modules/add-link-m2o.sh v1.0.0 — Создание связи Many-to-One через прямой доступ к SQLite NocoDB
+# modules/add-link-m2o.sh v1.1.0 — Создание связи Many-to-One через прямой доступ к SQLite NocoDB
 # 
 # Использование:
 #   bash modules/add-link-m2o.sh "ТаблицаОткуда" "КолонкаОткуда" "ТаблицаКуда" "КолонкаКуда"
@@ -20,6 +20,9 @@
 #   ✅ Создание Grid View для M2M таблицы
 #   ✅ Создание 2 колонок LinkToAnotherRecord в основных таблицах
 #   ✅ Создание 4 записей в nc_col_relations_v2 (mo, om, hm, hm)
+#   🆕 v1.1.0 (v4.67.0): подпись связи (meta.plural) без суффикса «s» — для русских
+#      названий таблиц «Проекты» + «s» = «Проектыs» было мусором в UI (дельта U012
+#      чинит наследие на живых установках; meta.plural заменён на название таблицы).
 
 set -e
 
@@ -236,11 +239,11 @@ VALUES
 
 -- 6. Создание колонки LinkToAnotherRecord в таблице FROM
 INSERT INTO nc_columns_v2 (id, source_id, base_id, fk_model_id, title, column_name, uidt, dt, dtx, pv, ai, rqd, un, system, "order", meta, fk_workspace_id, created_at, updated_at)
-VALUES ('$COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '$MODEL_FROM_ID', '$COLUMN_FROM', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 0, $NEW_ORDER_COLS_FROM, '{"plural":"${TABLE_TO}s","singular":"$TABLE_TO","defaultViewColOrder":$NEW_ORDER_GV_FROM,"defaultViewColVisibility":1}', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '$MODEL_FROM_ID', '$COLUMN_FROM', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 0, $NEW_ORDER_COLS_FROM, '{"plural":"$TABLE_TO","singular":"$TABLE_TO","defaultViewColOrder":$NEW_ORDER_GV_FROM,"defaultViewColVisibility":1}', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 7. Создание колонки LinkToAnotherRecord в таблице TO
 INSERT INTO nc_columns_v2 (id, source_id, base_id, fk_model_id, title, column_name, uidt, dt, dtx, pv, ai, rqd, un, system, "order", meta, fk_workspace_id, created_at, updated_at)
-VALUES ('$COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '$MODEL_TO_ID', '$COLUMN_TO', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 0, $NEW_ORDER_COLS_TO, '{"plural":"${TABLE_FROM}s","singular":"$TABLE_FROM","defaultViewColOrder":$NEW_ORDER_GV_TO,"defaultViewColVisibility":1}', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '$MODEL_TO_ID', '$COLUMN_TO', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 0, $NEW_ORDER_COLS_TO, '{"plural":"$TABLE_FROM","singular":"$TABLE_FROM","defaultViewColOrder":$NEW_ORDER_GV_TO,"defaultViewColVisibility":1}', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 8. Добавление колонок в Grid Views основных таблиц
 INSERT INTO nc_grid_view_columns_v2 (id, fk_view_id, fk_column_id, source_id, base_id, width, show, "order", fk_workspace_id, created_at, updated_at)
