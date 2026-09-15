@@ -1,5 +1,5 @@
 #!/bin/bash
-# modules/delete-view.sh v1.0.0 — Безопасное удаление view через SQLite NocoDB
+# modules/delete-view.sh v1.1.0 — Безопасное удаление view через SQLite NocoDB
 #
 # Обходит баг NocoDB UI (KnexTimeoutError при удалении view через интерфейс).
 # Работает через прямой доступ к SQLite, как остальные модули ядра миграций.
@@ -13,11 +13,15 @@
 #   bash modules/delete-view.sh "Дела" "Календарь"
 #   bash modules/delete-view.sh --id "vwp8ucycnpq3c8j2"
 #
-# Особенности v1.0.0:
+# Особенности:
 #   ✅ Защита от удаления последнего view таблицы (таблица не может остаться без view)
 #   ✅ Автопереназначение is_default при удалении дефолтного view
 #   ✅ Каскадная очистка: колонки view, фильтры, сортировки
 #   ✅ Поддержка всех типов view (grid, gallery, calendar, kanban, form и др.)
+#   ✅ v1.1.0: удаляются и НАСТРОЙКИ самого view (таблицы с колонкой `fk_view_id`:
+#      nc_grid_view_v2, nc_gallery_view_v2, nc_kanban_view_v2, nc_calendar_view_v2 …).
+#      Раньше они оставались осиротевшими строками — так в template.db накопилось 17.
+#      Список таблиц берётся из схемы базы (NocoDB добавляет их от версии к версии).
 #   ✅ Автобэкап БД перед изменениями
 #   ✅ .bail on в SQLite для мгновенного прерывания при ошибке
 #   ✅ Явный ROLLBACK при сбое транзакции
@@ -167,6 +171,19 @@ TIM_DELETE="DELETE FROM nc_timeline_view_columns_v2 WHERE fk_view_id='$VIEW_ID';
 GANTT_DELETE="DELETE FROM nc_gantt_view_columns_v2 WHERE fk_view_id='$VIEW_ID';"
 LIST_DELETE="DELETE FROM nc_list_view_columns_v2 WHERE fk_view_id='$VIEW_ID';"
 
+# Настройки САМОГО view (v1.1.0): «шапки» видов живут не в nc_*_view_columns_v2, а
+# в отдельных таблицах (nc_kanban_view_v2, nc_grid_view_v2, nc_gallery_view_v2 …).
+# Их не удаляли — и в template.db накопились 17 осиротевших строк (13 grid, 3 gallery,
+# 1 kanban): вид удалён, а настройки остались. Список таблиц берём из схемы базы
+# (а не хардкодом) — NocoDB добавляет такие таблицы от версии к версии.
+VIEW_CFG_TABLES=$(sqlite3 "$NOCO_DB" "SELECT name FROM sqlite_master m WHERE type='table' AND name!='nc_views_v2' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name='fk_view_id');")
+VIEW_CFG_DELETE=""
+while IFS= read -r CFG_TABLE; do
+    [ -z "$CFG_TABLE" ] && continue
+    VIEW_CFG_DELETE="${VIEW_CFG_DELETE}DELETE FROM \"$CFG_TABLE\" WHERE fk_view_id='$VIEW_ID';
+"
+done <<< "$VIEW_CFG_TABLES"
+
 # Удаляем фильтры и сортировки этого view
 FILTER_DELETE="DELETE FROM nc_filter_exp_v2 WHERE fk_view_id='$VIEW_ID';"
 SORT_DELETE="DELETE FROM nc_sort_v2 WHERE fk_view_id='$VIEW_ID';"
@@ -193,6 +210,7 @@ $GANTT_DELETE
 $LIST_DELETE
 $FILTER_DELETE
 $SORT_DELETE
+$VIEW_CFG_DELETE
 $VIEW_DELETE
 
 COMMIT;

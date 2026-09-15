@@ -303,6 +303,24 @@ else
 fi
 echo ""
 
+# Состав схемы (слепок): маркер версии говорит «до какой дельты догнали», а слепок —
+# «тот ли получился состав». Поле с тем же именем, но другим смыслом (список vs
+# одиночная связь) версию не ломает, а состав — ломает (кейс «Контакт/ответственный»).
+echo -e "${BLUE}🧬 Состав схемы (слепок против эталона):${NC}"
+if [ -f "$INSTALL_DIR/modules/schema-fingerprint.sh" ]; then
+    FP_RC=0
+    FP_OUT=$(NOCO_DB="$DB_PATH" TEMPLATE="$INSTALL_DIR/template.db" INSTALL_DIR="$INSTALL_DIR" \
+        bash "$INSTALL_DIR/modules/schema-fingerprint.sh" check 2>&1) || FP_RC=1
+    echo "$FP_OUT" | sed 's/^/   /'
+    if [ "$FP_RC" -ne 0 ]; then
+        echo -e "  ${YELLOW}⚠️  Состав отличается от эталона. Сначала догон: bash $INSTALL_DIR/upgrade.sh${NC}"
+        echo -e "  ${YELLOW}   Если не помогло — правка была только в UI NocoDB: нужна дельта (upgrades/README.md).${NC}"
+    fi
+else
+    echo -e "  ${YELLOW}⚠️  modules/schema-fingerprint.sh не найден — проверка состава пропущена${NC}"
+fi
+echo ""
+
 # ============================================
 # 13. НДС: НАСТРОЙКА ДОКУМЕНТОВ (v4.65.0)
 # ============================================

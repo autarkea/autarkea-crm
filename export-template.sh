@@ -12,6 +12,8 @@ echo -e "${BLUE}║   Экспорт рабочей базы в шаблон tem
 echo -e "${BLUE}║   🆕 Нормализация order + установка is_default        ║${NC}"
 echo -e "${BLUE}║   🆕 v3.1.0: чистка следов NocoDB (файлы/задания) +   ║${NC}"
 echo -e "${BLUE}║      честный маркер версии + контроль качества        ║${NC}"
+echo -e "${BLUE}║   🆕 v4.70.0: чистка настроек удалённых views (8.11), ║${NC}"
+echo -e "${BLUE}║      слепок состава (12.6) и дрейф vs git (12.7)      ║${NC}"
 echo -e "${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -222,6 +224,27 @@ WHERE id IN (
 DEFAULT_COUNT=$(sqlite3 "$TEMPLATE" "SELECT COUNT(*) FROM nc_views_v2 WHERE is_default = 1;")
 echo -e "${GREEN}   ✅ Дефолтных views: $DEFAULT_COUNT${NC}"
 
+# ============================================
+# 🆕 ПОДШАГ 8.11: СИРОТСКИЕ НАСТРОЙКИ САМИХ VIEW (v4.70.0)
+# ============================================
+# «Шапки» видов лежат не в nc_*_view_columns_v2, а в отдельных таблицах:
+# nc_grid_view_v2, nc_gallery_view_v2, nc_kanban_view_v2, nc_calendar_view_v2 и др.
+# Их не чистили — при удалении вида строка настройки оставалась. В эталоне так
+# накопилось 17 осиротевших строк (13 grid, 3 gallery, 1 kanban): NocoDB их не
+# показывает (вида нет), но они мусорят шаблон и путают аудит.
+# Список таблиц берём из схемы базы, а не хардкодом — NocoDB добавляет их от версии
+# к версии (колонка fk_view_id = признак «таблица настроек вида»).
+VIEW_CFG_CLEANED=0
+VIEW_CFG_TABLES=$(sqlite3 "$TEMPLATE" "SELECT name FROM sqlite_master m WHERE type='table' AND name!='nc_views_v2' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name='fk_view_id');")
+while IFS= read -r CFG_TABLE; do
+    [ -z "$CFG_TABLE" ] && continue
+    BEFORE=$(sqlite3 "$TEMPLATE" "SELECT COUNT(*) FROM \"$CFG_TABLE\";" 2>/dev/null || echo 0)
+    sqlite3 "$TEMPLATE" "DELETE FROM \"$CFG_TABLE\" WHERE fk_view_id NOT IN (SELECT id FROM nc_views_v2);" 2>/dev/null || true
+    AFTER=$(sqlite3 "$TEMPLATE" "SELECT COUNT(*) FROM \"$CFG_TABLE\";" 2>/dev/null || echo 0)
+    VIEW_CFG_CLEANED=$((VIEW_CFG_CLEANED + BEFORE - AFTER))
+done <<< "$VIEW_CFG_TABLES"
+echo -e "${GREEN}   ✅ Сиротских настроек views удалено: $VIEW_CFG_CLEANED${NC}"
+
 echo -e "${GREEN}✅ Сиротские записи удалены, order нормализован, is_default установлен${NC}"
 echo ""
 
@@ -323,6 +346,51 @@ fi
 echo ""
 
 # ============================================
+# 🆕 ПОДШАГ 12.6: СЛЕПОК СОСТАВА СХЕМЫ (v4.70.0)
+# ============================================
+# Зачем: маркер версии (12.5) говорит «до какой дельты догнали», но НЕ «какой
+# состав». Установка может догнать все дельты, а состав всё равно разъехаться:
+# поле с тем же ИМЕНЕМ, но другим СМЫСЛОМ (список вместо одиночной связи) —
+# ровно так вышло с «Контакт/ответственный». Слепок — sha256 состава эталона
+# (таблицы, колонки, uidt, смысл связей mo/om, опции селектов) — хранится в
+# nc_store. У клиента одна команда `modules/schema-fingerprint.sh check`
+# отвечает «состав совпадает со эталоном или нет» и печатает, что именно не так.
+echo -e "${BLUE}🧬 Подшаг 12.6: считаю слепок состава схемы (printed4u_schema_fingerprint)...${NC}"
+
+FINAL_FP=""
+if [ -f "modules/schema-fingerprint.sh" ]; then
+    FINAL_FP=$(NOCO_DB="$TEMPLATE_ABS" TEMPLATE="$TEMPLATE_ABS" \
+        bash modules/schema-fingerprint.sh set 2>/dev/null | tail -1 | sed 's/.*= //')
+fi
+
+if [ -n "$FINAL_FP" ]; then
+    echo -e "${GREEN}✅ Слепок состава записан: $FINAL_FP${NC}"
+    echo -e "${GREEN}   Проверка у клиента: bash modules/schema-fingerprint.sh check${NC}"
+else
+    echo -e "${YELLOW}⚠️  Слепок состава записать не удалось (modules/schema-fingerprint.sh)${NC}"
+fi
+echo ""
+
+# ============================================
+# 🆕 ПОДШАГ 12.7: ДРЕЙФ ЭТАЛОНА vs GIT (v4.70.0)
+# ============================================
+# Зачем: подшаг 12.5 отвечает «до какой дельты догнали», 12.6 — «тот ли состав»,
+# но ни один не говорит, ЧТО ИМЕННО изменилось в эталоне и покрыто ли это дельтой.
+# Инвариант ОТК (tests/template-schema.test.js) ловит забывчивость post factum,
+# а здесь барьер стоит в момент причёсывания эталона:
+#   🧩 мигрируемое (таблицы/колонки/смысл связей/опции) → нужна дельта, иначе
+#      правка уедет только в template.db (то есть лишь на свежую установку);
+#   🖼 виды → «эталон-онли»: раскладка UI, дельта НЕ нужна (upgrades/README.md).
+# Экспорт не валит — только предупреждает (см. --strict у модуля).
+echo -e "${BLUE}🧭 Подшаг 12.7: сверяю эталон с последним коммитом (дрейф)...${NC}"
+if [ -f modules/schema-drift.sh ]; then
+    INSTALL_DIR="$PWD" TEMPLATE="$TEMPLATE_ABS" bash modules/schema-drift.sh || true
+else
+    echo -e "${YELLOW}⚠️  modules/schema-drift.sh не найден — дрейф не проверить${NC}"
+fi
+echo ""
+
+# ============================================
 # VACUUM для уменьшения размера (после всех удалений)
 # ============================================
 echo -e "${BLUE}📦 Сжимаю базу (VACUUM)...${NC}"
@@ -363,6 +431,12 @@ sqlite3 "$TEMPLATE" "SELECT '   Сиротских в gallery: ' || COUNT(*) FRO
 sqlite3 "$TEMPLATE" "SELECT '   Сиротских в kanban: ' || COUNT(*) FROM nc_kanban_view_columns_v2 WHERE fk_column_id NOT IN (SELECT id FROM nc_columns_v2);"
 sqlite3 "$TEMPLATE" "SELECT '   Сиротских filters: ' || COUNT(*) FROM nc_filter_exp_v2 WHERE fk_column_id NOT IN (SELECT id FROM nc_columns_v2);"
 sqlite3 "$TEMPLATE" "SELECT '   Сиротских sorts: ' || COUNT(*) FROM nc_sort_v2 WHERE fk_column_id NOT IN (SELECT id FROM nc_columns_v2);"
+VIEW_CFG_ORPHANS=0
+for CFG_TABLE in $(sqlite3 "$TEMPLATE" "SELECT name FROM sqlite_master m WHERE type='table' AND name!='nc_views_v2' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name='fk_view_id');"); do
+    N=$(sqlite3 "$TEMPLATE" "SELECT COUNT(*) FROM \"$CFG_TABLE\" WHERE fk_view_id NOT IN (SELECT id FROM nc_views_v2);" 2>/dev/null || echo 0)
+    VIEW_CFG_ORPHANS=$((VIEW_CFG_ORPHANS + N))
+done
+sqlite3 "$TEMPLATE" "SELECT '   Сиротских в настройках views: $VIEW_CFG_ORPHANS';"
 
 echo ""
 echo -e "${YELLOW}📊 Проверка дубликатов order:${NC}"

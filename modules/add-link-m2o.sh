@@ -1,8 +1,9 @@
 #!/bin/bash
-# modules/add-link-m2o.sh v1.1.0 — Создание связи Many-to-One через прямой доступ к SQLite NocoDB
+# modules/add-link-m2o.sh v1.2.0 — Создание связи Many-to-One через прямой доступ к SQLite NocoDB
 # 
 # Использование:
 #   bash modules/add-link-m2o.sh "ТаблицаОткуда" "КолонкаОткуда" "ТаблицаКуда" "КолонкаКуда"
+#   SKIP_RESTART=1 bash modules/add-link-m2o.sh …   # без перезапуска NocoDB (движок upgrade.sh рестартит сам)
 #
 # Примеры:
 #   bash modules/add-link-m2o.sh "Дела" "Какой проект" "Проекты" "Дела"
@@ -23,6 +24,9 @@
 #   🆕 v1.1.0 (v4.67.0): подпись связи (meta.plural) без суффикса «s» — для русских
 #      названий таблиц «Проекты» + «s» = «Проектыs» было мусором в UI (дельта U012
 #      чинит наследие на живых установках; meta.plural заменён на название таблицы).
+#   🆕 v1.2.0 (v4.70.0): флаг SKIP_RESTART=1 — без перезапуска NocoDB. Нужен дельтам:
+#      движок upgrade.sh рестартит nocodb один раз в конце (шаг 7), а тесты дельт
+#      прогоняются на копии БД и не должны трогать рабочий контейнер.
 
 set -e
 
@@ -78,10 +82,16 @@ BASE_ID=$(sqlite3 "$NOCO_DB" "SELECT id FROM nc_bases_v2 LIMIT 1;")
 SOURCE_ID=$(sqlite3 "$NOCO_DB" "SELECT id FROM nc_sources_v2 WHERE base_id='$BASE_ID' LIMIT 1;")
 WORKSPACE_ID=$(sqlite3 "$NOCO_DB" "SELECT id FROM workspace LIMIT 1;")
 
-if [ -z "$BASE_ID" ] || [ -z "$SOURCE_ID" ] || [ -z "$WORKSPACE_ID" ]; then
-    log "❌ Ошибка: Не удалось найти base/source/workspace."
+if [ -z "$BASE_ID" ] || [ -z "$SOURCE_ID" ]; then
+    log "❌ Ошибка: Не удалось найти base/source."
     exit 1
 fi
+# v1.2.0: workspace может отсутствовать (эталон template.db вычищен, свежая база
+# до первого старта NocoDB). В эталоне fk_workspace_id = NULL — пишем NULL, а не падаем:
+# иначе дельты не применить на репетиции/свежей установке.
+WS_SQL="'$WORKSPACE_ID'"
+[ -n "$WORKSPACE_ID" ] || WS_SQL="NULL"
+log "✅ Base: $BASE_ID | Source: $SOURCE_ID | Workspace: ${WORKSPACE_ID:-<нет: пишу NULL>}"
 
 # === ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ТАБЛИЦАХ ===
 MODEL_FROM_INFO=$(sqlite3 "$NOCO_DB" "SELECT id, table_name FROM nc_models_v2 WHERE title='$TABLE_FROM' AND base_id='$BASE_ID';")
@@ -206,67 +216,67 @@ CREATE TABLE "$M2M_TABLE_NAME" (
 
 -- 2. Создание модели M2M таблицы в nc_models_v2 (флаг mm=1)
 INSERT INTO nc_models_v2 (id, source_id, base_id, table_name, title, type, mm, enabled, "order", fk_workspace_id, created_at, updated_at)
-VALUES ('$M2M_MODEL_ID', '$SOURCE_ID', '$BASE_ID', '$M2M_TABLE_NAME', '$M2M_MODEL_TITLE', 'table', 1, 1, $NEW_ORDER_MODELS, '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$M2M_MODEL_ID', '$SOURCE_ID', '$BASE_ID', '$M2M_TABLE_NAME', '$M2M_MODEL_TITLE', 'table', 1, 1, $NEW_ORDER_MODELS, $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 3. Создание 4 колонок в M2M таблице
 -- 3.1. ForeignKey для Projects_id
 INSERT INTO nc_columns_v2 (id, source_id, base_id, fk_model_id, title, column_name, uidt, dt, dtx, pv, ai, rqd, un, system, "order", meta, fk_workspace_id, created_at, updated_at)
-VALUES ('$M2M_FK_COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '$M2M_MODEL_ID', '$FK_COL_TO_NAME', '$FK_COL_TO_NAME', 'ForeignKey', 'integer', '', 0, 1, 1, 1, 0, 1, '{}', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$M2M_FK_COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '$M2M_MODEL_ID', '$FK_COL_TO_NAME', '$FK_COL_TO_NAME', 'ForeignKey', 'integer', '', 0, 1, 1, 1, 0, 1, '{}', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 3.2. ForeignKey для Tasks_id
 INSERT INTO nc_columns_v2 (id, source_id, base_id, fk_model_id, title, column_name, uidt, dt, dtx, pv, ai, rqd, un, system, "order", meta, fk_workspace_id, created_at, updated_at)
-VALUES ('$M2M_FK_COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '$M2M_MODEL_ID', '$FK_COL_FROM_NAME', '$FK_COL_FROM_NAME', 'ForeignKey', 'integer', '', 0, 1, 1, 1, 0, 2, '{}', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$M2M_FK_COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '$M2M_MODEL_ID', '$FK_COL_FROM_NAME', '$FK_COL_FROM_NAME', 'ForeignKey', 'integer', '', 0, 1, 1, 1, 0, 2, '{}', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 3.3. LinkToAnotherRecord для Projects (system=1)
 INSERT INTO nc_columns_v2 (id, source_id, base_id, fk_model_id, title, column_name, uidt, dt, dtx, pv, ai, rqd, un, system, "order", meta, fk_workspace_id, created_at, updated_at)
-VALUES ('$M2M_LINK_COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '$M2M_MODEL_ID', '$TABLE_TO', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 1, 3, '{"custom":false}', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$M2M_LINK_COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '$M2M_MODEL_ID', '$TABLE_TO', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 1, 3, '{"custom":false}', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 3.4. LinkToAnotherRecord для Tasks (system=1)
 INSERT INTO nc_columns_v2 (id, source_id, base_id, fk_model_id, title, column_name, uidt, dt, dtx, pv, ai, rqd, un, system, "order", meta, fk_workspace_id, created_at, updated_at)
-VALUES ('$M2M_LINK_COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '$M2M_MODEL_ID', '$TABLE_FROM', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 1, 4, '{"custom":false}', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$M2M_LINK_COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '$M2M_MODEL_ID', '$TABLE_FROM', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 1, 4, '{"custom":false}', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 4. Создание Grid View для M2M таблицы
 INSERT INTO nc_views_v2 (id, fk_model_id, type, title, fk_workspace_id, created_at, updated_at)
-VALUES ('$M2M_VIEW_ID', '$M2M_MODEL_ID', 3, '$M2M_TABLE_NAME', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$M2M_VIEW_ID', '$M2M_MODEL_ID', 3, '$M2M_TABLE_NAME', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 5. Добавление колонок в Grid View M2M таблицы
 INSERT INTO nc_grid_view_columns_v2 (id, fk_view_id, fk_column_id, source_id, base_id, width, show, "order", fk_workspace_id, created_at, updated_at)
 VALUES 
-    ('$GVC_M2M_1_ID', '$M2M_VIEW_ID', '$M2M_FK_COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, 1, '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    ('$GVC_M2M_2_ID', '$M2M_VIEW_ID', '$M2M_FK_COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, 2, '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    ('$GVC_M2M_3_ID', '$M2M_VIEW_ID', '$M2M_LINK_COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, 3, '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    ('$GVC_M2M_4_ID', '$M2M_VIEW_ID', '$M2M_LINK_COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, 4, '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+    ('$GVC_M2M_1_ID', '$M2M_VIEW_ID', '$M2M_FK_COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, 1, $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    ('$GVC_M2M_2_ID', '$M2M_VIEW_ID', '$M2M_FK_COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, 2, $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    ('$GVC_M2M_3_ID', '$M2M_VIEW_ID', '$M2M_LINK_COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, 3, $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    ('$GVC_M2M_4_ID', '$M2M_VIEW_ID', '$M2M_LINK_COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, 4, $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 6. Создание колонки LinkToAnotherRecord в таблице FROM
 INSERT INTO nc_columns_v2 (id, source_id, base_id, fk_model_id, title, column_name, uidt, dt, dtx, pv, ai, rqd, un, system, "order", meta, fk_workspace_id, created_at, updated_at)
-VALUES ('$COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '$MODEL_FROM_ID', '$COLUMN_FROM', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 0, $NEW_ORDER_COLS_FROM, '{"plural":"$TABLE_TO","singular":"$TABLE_TO","defaultViewColOrder":$NEW_ORDER_GV_FROM,"defaultViewColVisibility":1}', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '$MODEL_FROM_ID', '$COLUMN_FROM', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 0, $NEW_ORDER_COLS_FROM, '{"plural":"$TABLE_TO","singular":"$TABLE_TO","defaultViewColOrder":$NEW_ORDER_GV_FROM,"defaultViewColVisibility":1}', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 7. Создание колонки LinkToAnotherRecord в таблице TO
 INSERT INTO nc_columns_v2 (id, source_id, base_id, fk_model_id, title, column_name, uidt, dt, dtx, pv, ai, rqd, un, system, "order", meta, fk_workspace_id, created_at, updated_at)
-VALUES ('$COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '$MODEL_TO_ID', '$COLUMN_TO', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 0, $NEW_ORDER_COLS_TO, '{"plural":"$TABLE_FROM","singular":"$TABLE_FROM","defaultViewColOrder":$NEW_ORDER_GV_TO,"defaultViewColVisibility":1}', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '$MODEL_TO_ID', '$COLUMN_TO', '', 'LinkToAnotherRecord', '', '', 0, 0, 0, 0, 0, $NEW_ORDER_COLS_TO, '{"plural":"$TABLE_FROM","singular":"$TABLE_FROM","defaultViewColOrder":$NEW_ORDER_GV_TO,"defaultViewColVisibility":1}', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 8. Добавление колонок в Grid Views основных таблиц
 INSERT INTO nc_grid_view_columns_v2 (id, fk_view_id, fk_column_id, source_id, base_id, width, show, "order", fk_workspace_id, created_at, updated_at)
 VALUES 
-    ('$GVC_FROM_ID', '$VIEW_FROM_ID', '$COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, $NEW_ORDER_GV_FROM, '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-    ('$GVC_TO_ID', '$VIEW_TO_ID', '$COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, $NEW_ORDER_GV_TO, '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+    ('$GVC_FROM_ID', '$VIEW_FROM_ID', '$COL_FROM_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, $NEW_ORDER_GV_FROM, $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    ('$GVC_TO_ID', '$VIEW_TO_ID', '$COL_TO_ID', '$SOURCE_ID', '$BASE_ID', '200px', 1, $NEW_ORDER_GV_TO, $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- 9. Создание 4 записей в nc_col_relations_v2
 -- 9.1. mo: Основная связь (Tasks → Projects)
 INSERT INTO nc_col_relations_v2 (id, type, virtual, fk_column_id, fk_related_model_id, fk_child_column_id, fk_parent_column_id, fk_mm_model_id, fk_mm_child_column_id, fk_mm_parent_column_id, ur, dr, base_id, fk_workspace_id, created_at, updated_at, version)
-VALUES ('$REL_MO_ID', 'mo', 1, '$COL_FROM_ID', '$MODEL_TO_ID', '$ID_COL_FROM', '$ID_COL_TO', '$M2M_MODEL_ID', '$M2M_FK_COL_FROM_ID', '$M2M_FK_COL_TO_ID', 'NO ACTION', 'NO ACTION', '$BASE_ID', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2);
+VALUES ('$REL_MO_ID', 'mo', 1, '$COL_FROM_ID', '$MODEL_TO_ID', '$ID_COL_FROM', '$ID_COL_TO', '$M2M_MODEL_ID', '$M2M_FK_COL_FROM_ID', '$M2M_FK_COL_TO_ID', 'NO ACTION', 'NO ACTION', '$BASE_ID', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2);
 
 -- 9.2. om: Обратная связь (Projects → Tasks)
 INSERT INTO nc_col_relations_v2 (id, type, virtual, fk_column_id, fk_related_model_id, fk_child_column_id, fk_parent_column_id, fk_mm_model_id, fk_mm_child_column_id, fk_mm_parent_column_id, ur, dr, base_id, fk_workspace_id, created_at, updated_at, version)
-VALUES ('$REL_OM_ID', 'om', 1, '$COL_TO_ID', '$MODEL_FROM_ID', '$ID_COL_TO', '$ID_COL_FROM', '$M2M_MODEL_ID', '$M2M_FK_COL_TO_ID', '$M2M_FK_COL_FROM_ID', 'NO ACTION', 'NO ACTION', '$BASE_ID', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2);
+VALUES ('$REL_OM_ID', 'om', 1, '$COL_TO_ID', '$MODEL_FROM_ID', '$ID_COL_TO', '$ID_COL_FROM', '$M2M_MODEL_ID', '$M2M_FK_COL_TO_ID', '$M2M_FK_COL_FROM_ID', 'NO ACTION', 'NO ACTION', '$BASE_ID', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2);
 
 -- 9.3. hm: M2M → Projects
 INSERT INTO nc_col_relations_v2 (id, type, virtual, fk_column_id, fk_related_model_id, fk_child_column_id, fk_parent_column_id, base_id, fk_workspace_id, created_at, updated_at, version)
-VALUES ('$REL_HM_1_ID', 'hm', 1, '$M2M_LINK_COL_TO_ID', '$M2M_MODEL_ID', '$M2M_FK_COL_TO_ID', '$ID_COL_TO', '$BASE_ID', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2);
+VALUES ('$REL_HM_1_ID', 'hm', 1, '$M2M_LINK_COL_TO_ID', '$M2M_MODEL_ID', '$M2M_FK_COL_TO_ID', '$ID_COL_TO', '$BASE_ID', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2);
 
 -- 9.4. hm: M2M → Tasks
 INSERT INTO nc_col_relations_v2 (id, type, virtual, fk_column_id, fk_related_model_id, fk_child_column_id, fk_parent_column_id, base_id, fk_workspace_id, created_at, updated_at, version)
-VALUES ('$REL_HM_2_ID', 'hm', 1, '$M2M_LINK_COL_FROM_ID', '$M2M_MODEL_ID', '$M2M_FK_COL_FROM_ID', '$ID_COL_FROM', '$BASE_ID', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2);
+VALUES ('$REL_HM_2_ID', 'hm', 1, '$M2M_LINK_COL_FROM_ID', '$M2M_MODEL_ID', '$M2M_FK_COL_FROM_ID', '$ID_COL_FROM', '$BASE_ID', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2);
 
 COMMIT;
 EOF
@@ -282,9 +292,13 @@ fi
 
 log "✅ Транзакция успешно завершена"
 
-# === ПЕРЕЗАПУСК ===
-log "🔄 Перезапуск NocoDB..."
-docker restart nocodb 2>/dev/null || docker restart printed4u-nocodb 2>/dev/null || log "⚠️  Перезапустите NocoDB вручную."
+# === ПЕРЕЗАПУСК (с возможностью пропуска) ===
+if [ "${SKIP_RESTART:-0}" != "1" ]; then
+    log "🔄 Перезапуск NocoDB..."
+    docker restart nocodb 2>/dev/null || docker restart printed4u-nocodb 2>/dev/null || log "⚠️  Перезапустите NocoDB вручную."
+else
+    log "⏭️  Пропуск перезапуска (SKIP_RESTART=1)"
+fi
 
 log "✅ Связь M2O создана: $TABLE_FROM.$COLUMN_FROM ↔ $TABLE_TO.$COLUMN_TO"
 log "   📦 M2M таблица: $M2M_TABLE_NAME"

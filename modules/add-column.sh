@@ -1,12 +1,12 @@
 #!/bin/bash
-# modules/add-column.sh v4.4.4 — Добавление колонки через прямой доступ к SQLite NocoDB
+# modules/add-column.sh v4.5.0 — Добавление колонки через прямой доступ к SQLite NocoDB
 # 
 # Использование:
 #   bash modules/add-column.sh "Таблица" "Колонка" "Тип" ["Описание"] ["Дефолт"] ["Ширина"] ["rqd"] ["un"]
 #   SKIP_RESTART=1 bash modules/add-column.sh "Таблица" "Колонка" "Тип"  # без перезапуска NocoDB
 #
 # Типы колонок:
-#   TEXT, LONGTEXT, DATE, DATETIME, INTEGER, BOOLEAN, URL, EMAIL, CURRENCY
+#   TEXT, LONGTEXT, DATE, DATETIME, INTEGER, BOOLEAN, URL, EMAIL, CURRENCY, ATTACHMENT
 #   SELECT:Опция1,Опция2,Опция3
 #   MULTISELECT:Опция1,Опция2,Опция3
 #
@@ -18,6 +18,11 @@
 #   bash modules/add-column.sh "Позиции" "Цена" "CURRENCY" "Цена за единицу" "0" "120px"
 #   bash modules/add-column.sh "Проекты" "Приоритет" "SELECT:Высокий,Средний,Низкий" "Приоритет" "Средний" "120px"
 #   bash modules/add-column.sh "Дела" "Клиент_ID" "TEXT" "ID" "" "150px" "1" "1"  # required + unique
+#   bash modules/add-column.sh "Контакты" "Фото" "ATTACHMENT" "Фото контакта"   # вложения
+#
+# Особенности v4.5.0:
+#   🆕 ATTACHMENT: uidt=Attachment, dt=text, dtx=specificType (как UI NocoDB)
+#      + защита от «стёртых» вложений — физический тип TEXT, meta='{}'
 #
 # Особенности v4.4.4:
 #   ✅ Правильный uidt: SingleLineText (не varchar!)
@@ -86,11 +91,16 @@ BASE_ID=$(sqlite3 "$NOCO_DB" "SELECT id FROM nc_bases_v2 LIMIT 1;")
 SOURCE_ID=$(sqlite3 "$NOCO_DB" "SELECT id FROM nc_sources_v2 WHERE base_id='$BASE_ID' LIMIT 1;")
 WORKSPACE_ID=$(sqlite3 "$NOCO_DB" "SELECT id FROM workspace LIMIT 1;")
 
-if [ -z "$BASE_ID" ] || [ -z "$SOURCE_ID" ] || [ -z "$WORKSPACE_ID" ]; then
-    log "❌ Ошибка: Не удалось найти base/source/workspace."
+if [ -z "$BASE_ID" ] || [ -z "$SOURCE_ID" ]; then
+    log "❌ Ошибка: Не удалось найти base/source."
     exit 1
 fi
-log "✅ Base: $BASE_ID | Source: $SOURCE_ID | Workspace: $WORKSPACE_ID"
+# v4.5.0: workspace может отсутствовать (эталон template.db вычищен, свежая база
+# до первого старта NocoDB). В эталоне fk_workspace_id = NULL — пишем NULL, а не падаем:
+# иначе дельты не применить на репетиции/свежей установке.
+WS_SQL="'$WORKSPACE_ID'"
+[ -n "$WORKSPACE_ID" ] || WS_SQL="NULL"
+log "✅ Base: $BASE_ID | Source: $SOURCE_ID | Workspace: ${WORKSPACE_ID:-<нет: пишу NULL>}"
 
 MODEL_INFO=$(sqlite3 "$NOCO_DB" "SELECT id, table_name FROM nc_models_v2 WHERE title='$TABLE_TITLE' AND base_id='$BASE_ID';")
 if [ -z "$MODEL_INFO" ]; then
@@ -144,6 +154,7 @@ else
         URL)        SQL_TYPE="TEXT" ;;
         EMAIL)      SQL_TYPE="TEXT" ;;
         CURRENCY)   SQL_TYPE="DECIMAL" ;;
+        ATTACHMENT) SQL_TYPE="TEXT" ;;
         *)          SQL_TYPE="TEXT" ;;
     esac
     case "$COLUMN_TYPE" in
@@ -179,6 +190,12 @@ else
             NOCO_UIDT="Currency"; NOCO_DT="decimal"; NOCO_DTX="specificType"
             NOCO_META='{"currency_code":"BYN","currency_locale":"ru-BY","currency_prefix":"","currency_suffix":" BYN"}'
             ;;
+        ATTACHMENT)
+            # v4.5.0: как в UI NocoDB — uidt=Attachment, dt=text, dtx=specificType.
+            # Физически это TEXT (в колонке лежит JSON-массив вложений).
+            NOCO_UIDT="Attachment"; NOCO_DT="text"; NOCO_DTX="specificType"
+            NOCO_META='{}'
+            ;;
         *)
             # ✅ v4.4.2 — правильный uidt для Single Line Text
             NOCO_UIDT="SingleLineText"; NOCO_DT="string"; NOCO_DTX="specificType"
@@ -195,7 +212,7 @@ if [ -n "$GRID_VIEW_ID" ]; then
     GVC_ID=$(head /dev/urandom | tr -dc 'a-z0-9' | fold -w 15 | head -n 1)
     GV_MAX_ORDER=$(sqlite3 "$NOCO_DB" "SELECT COALESCE(MAX(\"order\"), 0) FROM nc_grid_view_columns_v2 WHERE fk_view_id='$GRID_VIEW_ID';")
     GV_NEW_ORDER=$(echo "$GV_MAX_ORDER + 1" | bc)
-    GV_INSERT="INSERT INTO nc_grid_view_columns_v2 (id, fk_view_id, fk_column_id, source_id, base_id, width, show, \"order\", fk_workspace_id, created_at, updated_at) VALUES ('$GVC_ID', '$GRID_VIEW_ID', '$COLUMN_ID', '$SOURCE_ID', '$BASE_ID', '$COLUMN_WIDTH', 1, $GV_NEW_ORDER, '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);"
+    GV_INSERT="INSERT INTO nc_grid_view_columns_v2 (id, fk_view_id, fk_column_id, source_id, base_id, width, show, \"order\", fk_workspace_id, created_at, updated_at) VALUES ('$GVC_ID', '$GRID_VIEW_ID', '$COLUMN_ID', '$SOURCE_ID', '$BASE_ID', '$COLUMN_WIDTH', 1, $GV_NEW_ORDER, $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);"
 fi
 
 # === ГЕНЕРАЦИЯ SELECT ОПЦИЙ ===
@@ -208,7 +225,7 @@ if [[ "$BASE_TYPE" == "SELECT" || "$BASE_TYPE" == "MULTISELECT" ]]; then
     for opt in "${OPT_ARRAY[@]}"; do
         OPT_ID=$(head /dev/urandom | tr -dc 'a-z0-9' | fold -w 15 | head -n 1)
         COLOR=${COLORS[$(( (ORDER-1) % ${#COLORS[@]} ))]}
-        SELECT_INSERTS+="INSERT INTO nc_col_select_options_v2 (id, fk_column_id, title, color, \"order\", base_id, fk_workspace_id) VALUES ('$OPT_ID', '$COLUMN_ID', '$opt', '$COLOR', $ORDER, '$BASE_ID', '$WORKSPACE_ID');"$'\n'
+        SELECT_INSERTS+="INSERT INTO nc_col_select_options_v2 (id, fk_column_id, title, color, \"order\", base_id, fk_workspace_id) VALUES ('$OPT_ID', '$COLUMN_ID', '$opt', '$COLOR', $ORDER, '$BASE_ID', $WS_SQL);"$'\n'
         log "  ✅ Опция: $opt (цвет: $COLOR)"
         ORDER=$((ORDER + 1))
     done
@@ -227,7 +244,7 @@ ALTER TABLE "$PHYSICAL_TABLE" ADD COLUMN "$COLUMN_NAME" $SQL_TYPE;
 
 -- INSERT в nc_columns_v2
 INSERT INTO nc_columns_v2 (id, source_id, base_id, fk_model_id, title, column_name, uidt, dt, dtx, pv, ai, rqd, un, system, "order", meta, description, cdf, fk_workspace_id, created_at, updated_at) 
-VALUES ('$COLUMN_ID', '$SOURCE_ID', '$BASE_ID', '$MODEL_ID', '$COLUMN_TITLE', '$COLUMN_NAME', '$NOCO_UIDT', '$NOCO_DT', '$NOCO_DTX', 0, 0, $REQUIRED, $UNIQUE, 0, $NEW_ORDER, '$NOCO_META', '$COLUMN_DESCRIPTION', '$COLUMN_DEFAULT', '$WORKSPACE_ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+VALUES ('$COLUMN_ID', '$SOURCE_ID', '$BASE_ID', '$MODEL_ID', '$COLUMN_TITLE', '$COLUMN_NAME', '$NOCO_UIDT', '$NOCO_DT', '$NOCO_DTX', 0, 0, $REQUIRED, $UNIQUE, 0, $NEW_ORDER, '$NOCO_META', '$COLUMN_DESCRIPTION', '$COLUMN_DEFAULT', $WS_SQL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 -- SELECT опции
 $SELECT_INSERTS
