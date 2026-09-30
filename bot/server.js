@@ -8,7 +8,9 @@ const nodemailer = require('nodemailer');
 // v4.37.0: единый расчёт НДС (shared/vat.js) — используется в bot.js и server.js.
 const vat = require('./shared/vat');
 // v4.58.0: общие «предохранители» — строгий id и безопасный путь (Проблемы 122/124).
-const { parsePositiveInt, safeJoinWithin } = require('./shared/guard');
+// v4.70.1: + работа с симлинками (isSymlink/removeSymlinkIfAny) — защита от цикла
+// ссылок в папке «Документы» (Проблема 135).
+const { parsePositiveInt, safeJoinWithin, removeSymlinkIfAny } = require('./shared/guard');
 // v4.64.4: проверка/выбор email для Reply-To (мусор в справочнике не должен
 // ронять письмо клиенту) — чистая логика в shared, юнит-тесты.
 const { pickEmail } = require('./shared/email-utils');
@@ -287,6 +289,16 @@ async function generatePDF(docId) {
                 const docsFolder = path.join(projectFolder, 'Документы');
                 if (!fs.existsSync(docsFolder)) fs.mkdirSync(docsFolder, { recursive: true });
                 pdfPath = path.join(docsFolder, pdfFileName);
+                // 🐛 v4.70.1 (Проблема 135): в «Документах» может лежать СИМЛИНК на
+                // этот же файл — его оставляет вебхук, когда PDF уже сгенерирован в
+                // noco-static/pdfs. Писать через такую ссылку нельзя: ниже мы создаём
+                // ОБРАТНУЮ ссылку в каталоге PDF, и получается цикл (ссылка → ссылка →
+                // сама себя). Ядро рубит обход на 40 переходах: ELOOP — генерация
+                // падает, а отправка письма говорит «PDF не найден». У файла в папке
+                // проекта один владелец — сам файл, поэтому ссылку снимаем.
+                if (removeSymlinkIfAny(pdfPath)) {
+                    console.log(`🔗 ${pdfFileName}: ссылка в «Документах» заменена реальным файлом (иначе был бы цикл ссылок)`);
+                }
                 savedInProject = true;
 
                 const symlinkPath = path.join(PDF_DIR, pdfFileName);
@@ -621,7 +633,7 @@ app.get('/', requireSecret, async (req, res) => {
         if (error.message === 'NO_DOC_TYPE') return res.status(400).send(getNoTypeHTML());
         if (error.message === 'NO_PROJECT_LINKED') return res.status(400).send(getNoProjectHTML());
         if (error.message === 'VAT_NOT_CONFIGURED') return res.status(400).send(getVatConfigHTML(error.vatMessage));
-        res.status(500).send(getErrorHTML(error.message));
+        res.status(500).send(getErrorHTML(error.message, docId, undefined, 'Ошибка генерации PDF'));
     }
 });
 
@@ -973,7 +985,9 @@ app.get('/send-email', requireSecret, async (req, res) => {
         pdfFileName = withStamp ? `${htmlFile}_${docNumber}.pdf` : `${htmlFile}_${docNumber}_notsigned.pdf`;
         
         const pdfPath = findPDFPath(pdfFileName, projectId);
-        if (!pdfPath) return res.status(404).send(getPDFNotFoundHTML(pdfFileName, docId, false));
+        // v4.70.1: показываем кнопку «Сгенерировать PDF» с секретом — это прямой выход
+        // из ситуации «файла нет / битая ссылка», без возврата в NocoDB.
+        if (!pdfPath) return res.status(404).send(getPDFNotFoundHTML(pdfFileName, docId, true, req.query.secret));
 
         const pdfUrl = `${NOCO_BASE_URL}/pdfs/${pdfFileName}?secret=${req.query.secret || ''}&_t=${Date.now()}`;
 
@@ -1212,7 +1226,7 @@ app.get('/generate-pdf', requireSecret, async (req, res) => {
             return res.status(400).send(getVatConfigHTML(e.vatMessage));
         }
         console.error(`❌ Ошибка в GET /generate-pdf для ID=${id}:`, e.message);
-        res.status(500).send(getErrorHTML(e.message, id));
+        res.status(500).send(getErrorHTML(e.message, id, undefined, 'Ошибка генерации PDF'));
     }
 });
 
@@ -1409,7 +1423,10 @@ function getEmailSuccessHTML({ docId, docType, toEmail, pdfFileName, messageId }
 <script>setTimeout(() => window.close(), 5000);</script></body></html>`;
 }
 
-function getErrorHTML(errorMessage, docId, solutionText) {
+// pageTitle — заголовок страницы. Раньше он был жёстко «Ошибка отправки email» для
+// ВСЕХ ошибок, поэтому падение генерации PDF показывало страницу про email и сбивало
+// с толку (v4.70.1, Проблема 135).
+function getErrorHTML(errorMessage, docId, solutionText, pageTitle = 'Ошибка отправки email') {
     // 🆕 Классификация ошибок SMTP для понятных подсказок
     const errorType = classifySMTPError(errorMessage);
 
@@ -1435,7 +1452,7 @@ h1 { color: var(--error-color); }
 .btn { display: inline-block; background: #e74c3c; color: #fff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-size: 15px; margin-top: 16px; transition: background .2s; }
 .btn:hover { background: #c0392b; }
 </style></head>
-<body><div class="container"><div class="icon">❌</div><h1>Ошибка отправки email</h1>
+<body><div class="container"><div class="icon">❌</div><h1>${escapeHtml(pageTitle)}</h1>
 <p class="subtitle">${errorType.title}</p>
 <div class="info-box"><h3>🔍 Что произошло?</h3><p>${errorType.description}</p>${errorType.technical ? `<p style="margin-top: 8px; font-size: 12px; color: #7f8c8d;">Техническая деталь: <code>${errorType.technical}</code></p>` : ''}</div>
 <div class="info-box" style="background: #f8f9fa; border-left-color: #667eea;"><h3 style="color: #2c3e50;">💡 Что делать?</h3><p>${errorType.solution}</p></div>
@@ -1451,6 +1468,18 @@ function classifySMTPError(message) {
     };
 
     const msg = message.toLowerCase();
+
+    // 🔗 Цикл симлинков (ELOOP): файл — ссылка сама на себя (Проблема 135).
+    // Проверяем ПЕРВОЙ: в тексте ошибки есть и «open», и путь, поэтому её легко
+    // перепутать с «файл не найден» и дать бесполезный совет.
+    if (msg.includes('eloop') || msg.includes('too many symbolic links')) {
+        return {
+            title: 'Битая ссылка на PDF-файл',
+            description: 'Файл документа на сервере оказался ссылкой самой на себя (цикл ссылок) — такую ссылку невозможно открыть. Обычно это следы старой ошибки при создании папки проекта.',
+            solution: 'Нажмите «🔄 Сгенерировать PDF» (или формулу-кнопку «Сгенерировать PDF» в NocoDB) — документ пересоберётся, и ссылка будет починена. После обновления системы (v4.70.1) такое лечится автоматически при повторной генерации.',
+            technical: message
+        };
+    }
 
     // 🔐 Ошибки аутентификации
     if (msg.includes('invalid login') || msg.includes('authentication failed') || msg.includes('auth')) {
@@ -1531,8 +1560,13 @@ function classifySMTPError(message) {
     };
 }
 
-function getPDFNotFoundHTML(fileName, docId, showGenerateBtn) {
-    const retryLink = docId ? `/generate-pdf?docId=${docId}` : 'javascript:history.back()';
+// showGenerateBtn — показывать кнопку «Сгенерировать PDF». Кнопка ведёт на защищённый
+// роут, поэтому ей нужен secret: без него получался тупик «PDF не найден» → 403
+// (замечено на кейсе с циклом ссылок, v4.70.1).
+function getPDFNotFoundHTML(fileName, docId, showGenerateBtn, secret = '') {
+    const retryLink = docId
+        ? `/generate-pdf?docId=${docId}${secret ? `&secret=${encodeURIComponent(secret)}` : ''}`
+        : 'javascript:history.back()';
     let buttons = '';
     if (showGenerateBtn !== false) {
         buttons = `<a href="${retryLink}" class="btn">🔄 Сгенерировать PDF</a>`;

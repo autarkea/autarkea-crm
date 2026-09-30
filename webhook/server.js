@@ -21,6 +21,8 @@ const {
     errorHttpStatus,
     decodeUploadFileName
 } = require('./shared/webhook-utils');
+// v4.70.1: защита от цикла ссылок (Проблема 135) — см. syncProjectDocuments.
+const { isSymlink } = require('./shared/guard');
 
 const app = express();
 app.use(express.json());
@@ -286,7 +288,14 @@ async function syncProjectDocuments(projectId, projectFolderPath) {
                 const sourcePath = path.join(PDF_DIR, matchingPdf);
                 const symlinkPath = path.join(docsFolder, matchingPdf);
 
-                if (!fs.existsSync(symlinkPath)) {
+                // 🐛 v4.70.1 (Проблема 135): если файл в каталоге PDF САМ является
+                // ссылкой — его владелец генератор (реальный файл лежит в «Документах»
+                // проекта). Ссылку в «Документы» в этом случае НЕ создаём: получились
+                // бы две ссылки друг на друга, и документ перестал бы открываться
+                // (ELOOP: «PDF не найден» при отправке).
+                if (isSymlink(sourcePath)) {
+                    console.log(`ℹ️ ${matchingPdf}: в каталоге PDF ссылка на файл проекта — синхронизация не нужна`);
+                } else if (!fs.existsSync(symlinkPath)) {
                     try {
                         fs.symlinkSync(sourcePath, symlinkPath);
                         console.log(`🔗 Создан symlink документа: ${matchingPdf}`);

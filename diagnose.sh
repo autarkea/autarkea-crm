@@ -184,6 +184,26 @@ for DIR in projects clients nocodb-data backups noco-static; do
 done
 echo ""
 
+# 🔗 v4.70.1 (Проблема 135): циклы симлинков в PDF и в папках «Документы».
+# Симптом: «ELOOP: too many symbolic links» при генерации PDF и «PDF-файл не найден»
+# при отправке письма. Цикл = две ссылки друг на друга (pdfs/x.pdf ⇄ Документы/x.pdf):
+# ядро обрывает обход на 40 переходах, и документ становится недоступен.
+# Цикл ищется через `find -L` (единственный надёжный способ: existsSync для такой
+# ссылки уже возвращает false, поэтому «битой» её не отличить от цикла иначе).
+count_pdf_loops() {
+    [ -d "$1" ] || { echo 0; return; }
+    find -L "$1" -maxdepth "$2" -type f -print 2>&1 >/dev/null \
+        | grep -c 'Too many levels of symbolic links' || true
+}
+LOOPS_TOTAL=$(( $(count_pdf_loops "$DATA_DIR/noco-static/pdfs" 1) + $(count_pdf_loops "$DATA_DIR/projects" 3) ))
+if [ "$LOOPS_TOTAL" -gt 0 ]; then
+    echo -e "  ${RED}❌ Цикл ссылок на PDF: $LOOPS_TOTAL (документ не открывается, Проблема 135)${NC}"
+    echo -e "  ${YELLOW}   💡 Лечение: нажать «Сгенерировать PDF» для этого документа — на v4.70.1+ ссылка чинится сама${NC}"
+else
+    echo -e "  ${GREEN}✅ Циклов ссылок на PDF нет${NC}"
+fi
+echo ""
+
 # ============================================
 # 7. ЛОГИ (ОШИБКИ ЗА ПОСЛЕДНИЕ 5 МИНУТ)
 # ============================================

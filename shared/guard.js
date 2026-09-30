@@ -6,9 +6,13 @@
 //     Проблема 124 — /pdfs/:filename читал любой файл контейнера);
 //   - parsePositiveInt: строгий разбор положительного целого id
 //     (parseInt('1; DROP TABLE') === 1 — Проблема 122).
+//   - isSymlink / removeSymlinkIfAny: работа с путями, где может оказаться
+//     симлинк (см. документацию, раздел «Проблема 135»: пара ссылок, ведущих
+//     друг на друга, обрывается в ELOOP и файл перестаёт открываться).
 // Тесты: tests/guard.test.js
 // ============================================================================
 
+const fs = require('fs');
 const path = require('path');
 
 // Собирает путь root/name, гарантируя, что результат лежит ВНУТРИ root.
@@ -41,4 +45,27 @@ function parsePositiveInt(value) {
     return null;
 }
 
-module.exports = { safeJoinWithin, parsePositiveInt };
+// Симлинк ли это. lstat НЕ разыменовывает ссылку, поэтому работает и на битой,
+// и на «зацикленной» ссылке (у которой existsSync уже возвращает false).
+function isSymlink(filePath) {
+    try {
+        return fs.lstatSync(filePath).isSymbolicLink();
+    } catch (e) {
+        if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return false;
+        throw e;
+    }
+}
+
+// Убирает симлинк по пути, НЕ трогая его цель (реальный файл).
+// Зачем: если записать файл по пути, где лежит ссылка, и одновременно держать
+// обратную ссылку на этот же путь — получаются две ссылки друг на друга. Ядро
+// обрывает такой обход на 40 переходах ошибкой ELOOP, и документ становится
+// недоступен (ни сгенерировать, ни отправить — «файл не найден»).
+// Возвращает true, если ссылку действительно удалили.
+function removeSymlinkIfAny(filePath) {
+    if (!isSymlink(filePath)) return false;
+    fs.rmSync(filePath, { force: true }); // удаляется сама ссылка, цель остаётся на месте
+    return true;
+}
+
+module.exports = { safeJoinWithin, parsePositiveInt, isSymlink, removeSymlinkIfAny };

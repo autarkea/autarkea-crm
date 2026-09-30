@@ -28,6 +28,10 @@ Thumbs.db
 *.swp
 *.swo
 
+# Cline: локальные настройки и артефакты (правила/скиллы версионируем — .clinerules/ и .clineignore)
+.cline/
+.agents/
+
 # Временные файлы
 *.tmp
 *.bak
