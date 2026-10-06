@@ -241,7 +241,7 @@ async function loadData() {
             signerId = Array.isArray(signerField) ? signerField[0]?.Id : (typeof signerField === 'object' ? signerField.Id : signerField);
         }
 
-        let юрлицо = {}, контакт = {}, менеджер = {}, signer = {};
+        let юрлицо = {}, контакт = {}, ответственный = {}, менеджер = {}, signer = {};
         
         if (clientId) { 
             const r = await fetch(`/api/client/${clientId}`); 
@@ -250,6 +250,16 @@ async function loadData() {
         if (contactId) { 
             const r = await fetch(`/api/contact/${contactId}`); 
             if (r.ok) { const d = await r.json(); контакт = d.list ? d.list[0] : d; } 
+        }
+        // 👤 «Контакт/ответственный» юрлица: в связи API отдаёт только {Id, Имя},
+        // e-mail добираем отдельным запросом. Если это тот же человек, что контакт
+        // проекта, — запрос не делаем (не дёргаем API зря).
+        let ответственныйId = null;
+        const ответственныйField = юрлицо['Контакт/ответственный'];
+        if (ответственныйField) ответственныйId = Array.isArray(ответственныйField) ? ответственныйField[0]?.Id : (typeof ответственныйField === 'object' ? ответственныйField.Id : ответственныйField);
+        if (ответственныйId && String(ответственныйId) !== String(contactId)) { 
+            const r = await fetch(`/api/contact/${ответственныйId}`); 
+            if (r.ok) { const d = await r.json(); ответственный = d.list ? d.list[0] : d; } 
         }
         if (managerId) { 
             const r = await fetch(`/api/employee/${managerId}`); 
@@ -272,7 +282,7 @@ async function loadData() {
         const regularItems = projectItems.filter(w => w['Тип'] !== 'Мат. заказчика');
         const customerMaterials = projectItems.filter(w => w['Тип'] === 'Мат. заказчика');
         
-        renderDocument(doc, project, regularItems, customerMaterials, юрлицо, контакт, менеджер, my, settings, signer);
+        renderDocument(doc, project, regularItems, customerMaterials, юрлицо, контакт, ответственный, менеджер, my, settings, signer);
         const overlay = document.getElementById('loading-overlay');
         if (overlay) overlay.remove();
     } catch (err) {
@@ -318,7 +328,7 @@ function generateDocNumber(dateStr, id) {
 const r2 = (x) => Math.round((Number(x) + 1e-9) * 100) / 100; // v4.66.0: единое округление (half-up до копеек)
 const fmt = (n) => r2(n).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
 
-function renderDocument(doc, project, regularItems, customerMaterials, юрлицо, контакт, менеджер, my, settings, signer) {
+function renderDocument(doc, project, regularItems, customerMaterials, юрлицо, контакт, ответственный, менеджер, my, settings, signer) {
     // 📄 ЗАГОЛОВОК И МЕТАДАННЫЕ
     const docOverride = doc['Название документа'] || doc['Название_документа'] || '';
     const settingsName = settings['Имя счета'] || settings['Имя_счета'] || '';
@@ -377,7 +387,11 @@ function renderDocument(doc, project, regularItems, customerMaterials, юрли�
     document.getElementById('clientBIK').textContent = юрлицо['БИК'] || '___________';
 
     // 📞 БЛОК КОНТАКТОВ
-    const clientLegalEmail = контакт['E-mail'] || юрлицо['E-mail'] || '___________';
+    // Единое правило «кому идут документы» (то же, что в боте): контакт проекта →
+    // «Контакт/ответственный» юрлица → общий ящик юрлица. Одно значение заполняет
+    // ДВА места: строку «Email для документов» в реквизитах и блок «КОНТАКТЫ».
+    const clientLegalEmail = контакт['E-mail'] || ответственный['E-mail'] || юрлицо['E-mail'] || '___________';
+    document.getElementById('clientLegalEmail').textContent = clientLegalEmail;
     document.getElementById('contactLegalEmail').textContent = clientLegalEmail;
     
     const contactWorkPhone = контакт['Телефон'] || юрлицо['Телефон'] || '___________';

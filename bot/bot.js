@@ -5079,14 +5079,17 @@ bot.on('callback_query', async (callbackQuery) => {
     }
 });
 
-// ================== HEALTH CHECK (каждые 5 минут) ==================
+// ================== HEALTH CHECK (каждые 2 минуты) ==================
 const healthLog = [];
 const MAX_HEALTH_LOG = 100;
 // v4.46.0 (Проблема 117): состояние проверки поллинга между тиками — для
 // двухтактного решения (один тик подозрение, два — застревание, см. shared/watchdog.js).
+// v4.71.0: интервал 5 → 2 мин — детект зависшего поллинга укладывается в ~4 мин
+// (было до ~10). Частые обрывы канала до Telegram у клиентов не должны давать
+// длинного простоя; порог в 2 тика оставлен против ложных срабатываний.
 let pollWatchState = { prevCheckAt: Date.now(), strike: 0 };
 
-cron.schedule('*/5 * * * *', async () => {
+cron.schedule('*/2 * * * *', async () => {
     const ts = new Date().toLocaleString('ru-RU', { timeZone: config.TZ });
     const issues = [];
 
@@ -5141,7 +5144,13 @@ cron.schedule('*/5 * * * *', async () => {
     pollWatchState.strike = verdict.strike;
     if (verdict.wedged) {
         wedged = true;
-        issues.push(`Telegram-поллинг завис: апдейты не доходят (pending=${pollPending}) — ${verdict.reason}`);
+        // v4.71.0: текст отличает ВНЕШНИЙ сбой канала (Telegram/сеть) от поломки CRM —
+        // иначе алерт пугает владельца, хотя бот лечится сам (см. schedulePollRestart ниже).
+        issues.push(`Telegram-поллинг завис: апдейты не доходят (pending=${pollPending}). Похоже на внешний сбой канала до Telegram (сеть/сам Telegram), не поломка CRM — перезапускаю поллинг автоматически.`);
+    } else if (verdict.strike > 0) {
+        // v4.71.0: первый тик подозрения логируем явно (раньше он шёл как «Health check OK»,
+        // и до финального FAIL контекста в логах не было).
+        console.log(`⚠️ Health check: подозрение на зависание поллинга — ${verdict.reason}`);
     }
 
     // Логируем
