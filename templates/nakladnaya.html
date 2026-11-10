@@ -583,6 +583,12 @@ function renderDocument(doc, project, items, юрлицо, контакт, my, s
         totalSum += sumWithoutVatR;
         totalVAT += vatAmount;
         totalWithVAT += sumWithVat;
+
+        // v4.71.1: «Итого» количество раньше всегда печаталось 0 — счётчик был
+        // объявлен и выводился, но нигде не накапливался. Строка держится ВНЕ
+        // НДС-блока: денежная логика обязана оставаться идентичной во всех
+        // шаблонах документов (её сверяет отдельная проверка паритета).
+        totalQty += qty;
         
         const row = document.createElement('tr');
         row.innerHTML = `
@@ -600,7 +606,7 @@ function renderDocument(doc, project, items, юрлицо, контакт, my, s
         tbody.appendChild(row);
     });
     
-    document.getElementById('totalQty').textContent = totalQty;
+    document.getElementById('totalQty').textContent = r2(totalQty); // r2: 0.1+0.2 не превращается в «0.30000000000000004»
     document.getElementById('totalPrice').textContent = '-';
     document.getElementById('totalSum').textContent = fmt(totalSum);
     document.getElementById('totalVAT').textContent = fmt(totalVAT);
