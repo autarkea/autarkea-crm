@@ -15,7 +15,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo -e "${BLUE}╔═══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║   МАКСИМАЛЬНАЯ ДИАГНОСТИКА Printed4U CRM v2.1.0        ║${NC}"
+echo -e "${BLUE}║   МАКСИМАЛЬНАЯ ДИАГНОСТИКА Printed4U CRM v2.2.0        ║${NC}"
 echo -e "${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -89,12 +89,21 @@ if [ -f "$ENV_FILE" ]; then
     
     if [ -n "$TOKEN" ] && [ "$TOKEN" != "your_noco_token_here" ]; then
         echo -e "${GREEN}✅ NOCO_TOKEN установлен${NC}"
-        
-        RESPONSE_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" "http://localhost:8081/api/v2/meta/bases" -H "xc-token: $TOKEN" 2>/dev/null || echo "000")
-        
+
+        # v4.71.3: свой временный файл (mktemp) + нормализация кода ответа.
+        # Было: `curl -w '%{http_code}' ... || echo "000"` — при ненулевом коде
+        # выхода curl к «200» дописывался «000», и диагностика печатала
+        # «❌ API вернул неожиданный код: HTTP 200000» (ложная тревога).
+        API_TMP=$(mktemp /tmp/p4u-diagnose-api.XXXXXX 2>/dev/null || echo "/tmp/p4u-diagnose-api.$$")
+        RESPONSE_CODE=$(curl -s -o "$API_TMP" -w "%{http_code}" "http://localhost:8081/api/v2/meta/bases" -H "xc-token: $TOKEN" 2>/dev/null)
+        CURL_RC=$?
+        RESPONSE_CODE=$(printf '%s' "$RESPONSE_CODE" | tr -cd '0-9' | cut -c1-3)
+        [ -n "$RESPONSE_CODE" ] || RESPONSE_CODE="000"
+
         if [ "$RESPONSE_CODE" = "200" ]; then
             echo -e "${GREEN}✅ API отвечает (HTTP 200)${NC}"
-            BASES_COUNT=$(python3 -c "import json; print(len(json.load(open('/tmp/api_response.json'))['list']))" 2>/dev/null || echo "0")
+            [ "$CURL_RC" != "0" ] && echo -e "${YELLOW}   ⚠️  curl вернул код $CURL_RC (ответ при этом получен)${NC}"
+            BASES_COUNT=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['list']))" "$API_TMP" 2>/dev/null || echo "0")
             echo "   Баз найдено: $BASES_COUNT"
         elif [ "$RESPONSE_CODE" = "401" ]; then
             echo -e "${RED}❌ API вернул 401 (Неверный NOCO_TOKEN)${NC}"
@@ -104,17 +113,25 @@ if [ -f "$ENV_FILE" ]; then
             echo -e "${YELLOW}💡 Совет: проверь 'sudo docker logs nocodb'${NC}"
         else
             echo -e "${RED}❌ API вернул неожиданный код: HTTP $RESPONSE_CODE${NC}"
+            [ "$CURL_RC" != "0" ] && echo -e "${YELLOW}   curl: код выхода $CURL_RC${NC}"
         fi
-        
+        rm -f "$API_TMP" 2>/dev/null || true
+
         if [ -n "$BASE_ID" ] && [ "$BASE_ID" != "your_base_id_here" ]; then
             echo -e "${GREEN}✅ BASE_ID установлен: $BASE_ID${NC}"
-            TABLES_CODE=$(curl -s -o /tmp/tables_response.json -w "%{http_code}" "http://localhost:8081/api/v2/meta/bases/$BASE_ID/tables" -H "xc-token: $TOKEN" 2>/dev/null || echo "000")
+            TABLES_TMP=$(mktemp /tmp/p4u-diagnose-tables.XXXXXX 2>/dev/null || echo "/tmp/p4u-diagnose-tables.$$")
+            TABLES_CODE=$(curl -s -o "$TABLES_TMP" -w "%{http_code}" "http://localhost:8081/api/v2/meta/bases/$BASE_ID/tables" -H "xc-token: $TOKEN" 2>/dev/null)
+            TABLES_CURL_RC=$?
+            TABLES_CODE=$(printf '%s' "$TABLES_CODE" | tr -cd '0-9' | cut -c1-3)
+            [ -n "$TABLES_CODE" ] || TABLES_CODE="000"
             if [ "$TABLES_CODE" = "200" ]; then
-                TABLES_COUNT=$(python3 -c "import json; print(len(json.load(open('/tmp/tables_response.json'))['list']))" 2>/dev/null || echo "0")
+                TABLES_COUNT=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['list']))" "$TABLES_TMP" 2>/dev/null || echo "0")
                 echo -e "${GREEN}✅ Таблицы доступны: $TABLES_COUNT${NC}"
+                [ "$TABLES_CURL_RC" != "0" ] && echo -e "${YELLOW}   ⚠️  curl вернул код $TABLES_CURL_RC (ответ при этом получен)${NC}"
             else
                 echo -e "${RED}❌ Таблицы недоступны (HTTP $TABLES_CODE)${NC}"
             fi
+            rm -f "$TABLES_TMP" 2>/dev/null || true
         else
             echo -e "${RED}❌ BASE_ID не установлен или является плейсхолдером${NC}"
             echo -e "${YELLOW}💡 Совет: запусти 'bash $INSTALL_DIR/setup-bot.sh'${NC}"
@@ -159,11 +176,17 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}🔗 5. WEBHOOK${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-WEBHOOK_HEALTH=$(curl -s -w "%{http_code}" "http://localhost:3001/health" -o /dev/null 2>/dev/null || echo "000")
+WEBHOOK_HEALTH=$(curl -s -w "%{http_code}" "http://localhost:3001/health" -o /dev/null 2>/dev/null)
+WEBHOOK_RC=$?
+# v4.71.3: нормализация кода (не `|| echo "000"` — иначе «200» + «000» = 200000).
+WEBHOOK_HEALTH=$(printf '%s' "$WEBHOOK_HEALTH" | tr -cd '0-9' | cut -c1-3)
+[ -n "$WEBHOOK_HEALTH" ] || WEBHOOK_HEALTH="000"
 if [ "$WEBHOOK_HEALTH" = "200" ]; then
     echo -e "${GREEN}✅ Webhook отвечает локально (HTTP 200)${NC}"
+    [ "$WEBHOOK_RC" != "0" ] && echo -e "${YELLOW}   ⚠️  curl вернул код $WEBHOOK_RC (ответ при этом получен)${NC}"
 else
     echo -e "${RED}❌ Webhook не отвечает локально (HTTP $WEBHOOK_HEALTH)${NC}"
+    [ "$WEBHOOK_RC" != "0" ] && echo -e "${YELLOW}   curl: код выхода $WEBHOOK_RC${NC}"
 fi
 echo ""
 
@@ -349,28 +372,41 @@ echo -e "${BLUE}🧮 13. НДС: НАСТРОЙКА ДОКУМЕНТОВ${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 VAT_TABLE=$(sudo sqlite3 "$DB_PATH" "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%Мои реквизиты';" 2>/dev/null | head -1)
-if [ -n "$VAT_TABLE" ]; then
-    VAT_TYPE=$(sudo sqlite3 "$DB_PATH" "SELECT COALESCE(\"Тип НДС\",'') FROM \"$VAT_TABLE\" LIMIT 1;" 2>/dev/null)
-    VAT_RATE=$(sudo sqlite3 "$DB_PATH" "SELECT COALESCE(\"Ставка НДС\",'') FROM \"$VAT_TABLE\" LIMIT 1;" 2>/dev/null)
-    [ -z "$VAT_TYPE" ] && VAT_TYPE="Без НДС"
-    VAT_RATE_NUM=$(echo "$VAT_RATE" | tr ',' '.' | tr -cd '0-9.')
-    echo "   Тип НДС: \"$VAT_TYPE\" | Ставка НДС: ${VAT_RATE:-не заполнена}"
-    case "$VAT_TYPE" in
-        "Без НДС")
-            echo -e "  ${GREEN}✅ Документы формируются без НДС (УСН)${NC}" ;;
-        "Начисляется сверху"|"Включен в цену")
-            if [ -n "$VAT_RATE_NUM" ] && awk "BEGIN{exit !($VAT_RATE_NUM > 0)}"; then
-                echo -e "  ${GREEN}✅ Ставка заполнена — документы формируются${NC}"
-            else
-                echo -e "  ${RED}❌ Тип НДС задан, а ставка не заполнена → генерация и отправка документов ЗАБЛОКИРОВАНЫ${NC}"
-                echo -e "  ${YELLOW}   В документе была бы ставка «0%» и нулевой НДС — это НЕ то же, что «Без НДС».${NC}"
-                echo -e "  ${YELLOW}   Исправь: NocoDB → «Мои реквизиты» → «Ставка НДС» (например 20)${NC}"
-                echo -e "  ${YELLOW}   или в боте кнопка «🛠 Задать ставку НДС».${NC}"
-            fi ;;
-        *)
-            echo -e "  ${RED}❌ Неизвестный «Тип НДС»: \"$VAT_TYPE\" → генерация документов ЗАБЛОКИРОВАНА${NC}"
-            echo -e "  ${YELLOW}   Допустимо: «Без НДС», «Начисляется сверху», «Включен в цену».${NC}" ;;
-    esac
+VAT_READER="$INSTALL_DIR/modules/vat-config-read.sh"
+if [ -n "$VAT_TABLE" ] && [ -f "$VAT_READER" ]; then
+    # v4.71.3: значения читаем ПО МЕТАДАННЫМ (title → column_name). Раньше запрос
+    # шёл по заголовку «Тип НДС», а колонка в SQLite называется `Тип_НДС` →
+    # SQLite молча возвращал сам литерал «Тип НДС» и диагностика показывала
+    # ложное «Неизвестный Тип НДС → генерация ЗАБЛОКИРОВАНА» при верных данных.
+    VAT_CFG=$(sudo bash "$VAT_READER" --db "$DB_PATH" 2>/dev/null)
+    VAT_RC=$?
+    VAT_TYPE=$(printf '%s\n' "$VAT_CFG" | sed -n 's/^TYPE=//p')
+    VAT_RATE=$(printf '%s\n' "$VAT_CFG" | sed -n 's/^RATE=//p')
+    if [ "$VAT_RC" -ne 0 ]; then
+        echo -e "  ${YELLOW}⚠️  Не удалось прочитать «Тип НДС»/«Ставку НДС» (таблица или колонки не найдены) — проверка пропущена${NC}"
+    else
+        [ -z "$VAT_TYPE" ] && VAT_TYPE="Без НДС"
+        VAT_RATE_NUM=$(echo "$VAT_RATE" | tr ',' '.' | tr -cd '0-9.')
+        echo "   Тип НДС: \"$VAT_TYPE\" | Ставка НДС: ${VAT_RATE:-не заполнена}"
+        case "$VAT_TYPE" in
+            "Без НДС")
+                echo -e "  ${GREEN}✅ Документы формируются без НДС (УСН)${NC}" ;;
+            "Начисляется сверху"|"Включен в цену")
+                if [ -n "$VAT_RATE_NUM" ] && awk "BEGIN{exit !($VAT_RATE_NUM > 0)}"; then
+                    echo -e "  ${GREEN}✅ Ставка заполнена — документы формируются${NC}"
+                else
+                    echo -e "  ${RED}❌ Тип НДС задан, а ставка не заполнена → генерация и отправка документов ЗАБЛОКИРОВАНЫ${NC}"
+                    echo -e "  ${YELLOW}   В документе была бы ставка «0%» и нулевой НДС — это НЕ то же, что «Без НДС».${NC}"
+                    echo -e "  ${YELLOW}   Исправь: NocoDB → «Мои реквизиты» → «Ставка НДС» (например 20)${NC}"
+                    echo -e "  ${YELLOW}   или в боте кнопка «🛠 Задать ставку НДС».${NC}"
+                fi ;;
+            *)
+                echo -e "  ${RED}❌ Неизвестный «Тип НДС»: \"$VAT_TYPE\" → генерация документов ЗАБЛОКИРОВАНА${NC}"
+                echo -e "  ${YELLOW}   Допустимо: «Без НДС», «Начисляется сверху», «Включен в цену».${NC}" ;;
+        esac
+    fi
+elif [ -n "$VAT_TABLE" ]; then
+    echo -e "  ${YELLOW}⚠️  modules/vat-config-read.sh не найден — проверка НДС пропущена${NC}"
 else
     echo -e "  ${YELLOW}⚠️  Таблица «Мои реквизиты» не найдена — настройка НДС не проверена${NC}"
 fi

@@ -1,6 +1,6 @@
 services:
   nocodb:
-    image: nocodb/nocodb:2026.08.2
+    image: nocodb/nocodb:2026.10.1
     container_name: nocodb
     user: "${APP_UID:-1000}:${APP_GID:-1000}"
     init: true

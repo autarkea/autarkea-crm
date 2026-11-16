@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# upgrade.sh v1.4.0 — движок обновления установленной Printed4U CRM
+# upgrade.sh v1.6.0 — движок обновления установленной Printed4U CRM
 # Обновляет УЖЕ РАБОТАЮЩУЮ систему клиента (с данными), НЕ пересоздавая базу
 # (в отличие от apply-template.sh). Порядок:
 #   1. Префлайт   2. Бэкап   3. Schema repair   4. Дельты upgrades/U*.sh
@@ -11,7 +11,24 @@
 #   --dry-run --skip-backup --skip-git --skip-compose --skip-bot
 #   --skip-diagnose --skip-restart --skip-modules (не трогать host-cron)
 #   --db-only (только БД-часть, для репетиции на копии; = skip-git/compose/bot/restart/diagnose/modules)
+#   --allow-nocodb-upgrade (разрешить compose пересоздать nocodb; по умолчанию запрещено)
+#   --skip-nocodb-upgrade (не обновлять движок: только bot/webhook)
 #   --install-dir PATH --db PATH
+# ============================================================================
+# Изменения v1.6.0 (v4.71.3):
+# - АВТО-ОБНОВЛЕНИЕ ДВИЖКА. Если в docker-compose.yml новый тег NocoDB, upgrade.sh
+#   сам вызывает upgrade-nocodb.sh (бэкап БД → pull → проверки → авто-откат).
+#   Клиенту достаточно одной команды `bash upgrade.sh`. Провал обновления движка =
+#   остановка upgrade.sh (сервис nocodb не тронут). Отключить — --skip-nocodb-upgrade.
+# ============================================================================
+# Изменения v1.5.0 (v4.71.2):
+# - GUARD ОБРАЗА NocoDB. upgrade.sh делает `docker compose up -d`, а если в
+#   docker-compose.yml приехал новый тег образа NocoDB, compose ПЕРЕСОЗДАСТ
+#   контейнер nocodb: движок при старте мигрирует мета-схему, откат несимметричен.
+#   Бэкап БД, пост-проверки и авто-откат есть ТОЛЬКО в upgrade-nocodb.sh, поэтому
+#   теперь при расхождении тегов compose ограничивается сервисами bot/webhook
+#   (проверка — modules/nocodb-image-guard.sh). Осознанный обход —
+#   --allow-nocodb-upgrade.
 # ============================================================================
 # Изменения v1.4.0 (v4.63.0):
 # - ДОКАТКА МОДУЛЕЙ ОБОБЩЕНА: вместо захардкоженного списка (health-alert,
@@ -51,6 +68,14 @@ SKIP_BOT=false
 SKIP_DIAGNOSE=false
 SKIP_RESTART=false
 SKIP_MODULES=false
+ALLOW_NOCODB_UPGRADE=false
+# v4.71.3: не трогать движок вообще (обновить только bot/webhook). По умолчанию
+# при новом теге в compose upgrade.sh сам вызывает upgrade-nocodb.sh.
+SKIP_NOCODB_UPGRADE=false
+# v4.71.2: сервисы для `docker compose up`. Пусто = все; при расхождении тега
+# образа NocoDB — «--no-deps bot webhook» (без этого compose подтянул бы
+# depends_on: nocodb и всё равно пересоздал контейнер). См. guard ниже.
+COMPOSE_SERVICES=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -62,6 +87,8 @@ while [ $# -gt 0 ]; do
         --skip-diagnose) SKIP_DIAGNOSE=true ;;
         --skip-restart)  SKIP_RESTART=true ;;
         --skip-modules)  SKIP_MODULES=true ;;
+        --allow-nocodb-upgrade) ALLOW_NOCODB_UPGRADE=true ;;
+        --skip-nocodb-upgrade)  SKIP_NOCODB_UPGRADE=true ;;
         --db-only)       SKIP_GIT=true; SKIP_COMPOSE=true; SKIP_BOT=true; SKIP_RESTART=true; SKIP_DIAGNOSE=true; SKIP_MODULES=true ;;
         --install-dir)   INSTALL_DIR="$2"; shift ;;
         --db)            NOCO_DB="$2"; shift ;;
@@ -78,6 +105,60 @@ GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC
 
 log() { echo -e "$*"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] $(echo -e "$*" | sed 's/\x1b\[[0-9;]*m//g')" >> "$LOG_FILE" 2>/dev/null || true; }
 err() { log "${RED}❌ $*${NC}"; exit 1; }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v4.71.3: GUARD + АВТО-ОБНОВЛЕНИЕ ДВИЖКА NocoDB.
+# NocoDB мигрирует мета-схему при старте, откат несимметричен (старый образ на
+# мигрированной БД может не подняться). Бэкап, пост-проверки и авто-откат делает
+# ТОЛЬКО upgrade-nocodb.sh, а `docker compose up -d` при новом теге в compose
+# пересоздал бы контейнер в обход. Поэтому:
+#   1) тег в compose ≠ запущенному → вызываем upgrade-nocodb.sh (безопасно);
+#      провал = остановка upgrade.sh, nocodb не тронута;
+#   2) --skip-nocodb-upgrade → не трогаем движок, обновляем только bot/webhook;
+#   3) автоматика недоступна (нет скрипта/кривой тег) → тоже только bot/webhook.
+# Так клиенту достаточно одной команды `bash upgrade.sh`.
+# ═══════════════════════════════════════════════════════════════════════════
+detect_nocodb_image_pending() {
+    COMPOSE_SERVICES=""
+    [ "$ALLOW_NOCODB_UPGRADE" = true ] && return 0
+    local guard="$INSTALL_DIR/modules/nocodb-image-guard.sh"
+    [ -f "$guard" ] || return 0
+    local out rc=0
+    out=$(bash "$guard" --compose "$INSTALL_DIR/docker-compose.yml" 2>/dev/null) || rc=$?
+    [ "$rc" -eq 10 ] || return 0
+
+    local ctag rtag
+    ctag=$(printf '%s\n' "$out" | sed -n 's/^compose=\([^ ]*\) running=.*/\1/p')
+    rtag=$(printf '%s\n' "$out" | sed -n 's/^compose=[^ ]* running=//p')
+
+    # 1) Осознанно просили движок не трогать — старое поведение (только bot/webhook).
+    if [ "$SKIP_NOCODB_UPGRADE" = true ]; then
+        COMPOSE_SERVICES="--no-deps bot webhook"
+        log "${YELLOW}   ⚠️  NocoDB: в compose $ctag, запущено $rtag — движок не обновляю (--skip-nocodb-upgrade).${NC}"
+        return 0
+    fi
+
+    # 2) Безопасное авто-обновление движка: бэкап → проверки → авто-откат.
+    if [ -n "$ctag" ] && [ -n "$rtag" ] \
+        && printf '%s' "$ctag" | grep -qE '^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}$' \
+        && [ -f "$INSTALL_DIR/upgrade-nocodb.sh" ]; then
+        log "${BLUE}   🔄 NocoDB: $rtag → $ctag — обновляю безопасной процедурой${NC}"
+        log "      (бэкап БД → pull → проверки совместимости → авто-откат при провале)"
+        # upgrade-nocodb.sh берёт «текущую» версию ИЗ COMPOSE. Возвращаем туда
+        # фактическую (running), иначе он решит «уже актуальна» и выйдет с кодом 2.
+        sed -i "s|^\(\s*image: nocodb/nocodb:\).*|\1$rtag|" "$INSTALL_DIR/docker-compose.yml"
+        if ! bash "$INSTALL_DIR/upgrade-nocodb.sh" --to "$ctag" --yes; then
+            err "NocoDB не обновлена — обновление CRM остановлено (сервис nocodb не тронут; бэкап: /mnt/data/backups/nocodb-upgrade)"
+        fi
+        COMPOSE_SERVICES=""
+        return 0
+    fi
+
+    # 3) Автоматика недоступна — не пересоздаём nocodb «мимо» процедуры.
+    COMPOSE_SERVICES="--no-deps bot webhook"
+    log "${YELLOW}   ⚠️  NocoDB: в compose $ctag, запущено $rtag — сервис nocodb НЕ пересоздаю.${NC}"
+    log "${YELLOW}      Обнови отдельно: bash upgrade-nocodb.sh --to $ctag${NC}"
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. ПРЕФЛАЙТ
@@ -280,11 +361,13 @@ else
                 log "   ℹ️  .env уже содержит все безопасные дефолты из .env.example"
             fi
         fi
-        log "   docker compose up -d --build ..."
+        # v4.71.2: если в compose новый тег NocoDB — не пересоздаём её здесь.
+        detect_nocodb_image_pending
+        log "   docker compose up -d --build ${COMPOSE_SERVICES}..."
         # 📮 v4.49.0: каталог outbox-очереди должен существовать ДО старта бота
         # (иначе bind-mount создаст его от root, и контейнерный UID не сможет писать).
         mkdir -p /mnt/data/logs 2>/dev/null || true
-        docker compose up -d --build 2>&1 | sed 's/^/   /' || err "docker compose up -d --build не удался"
+        docker compose up -d --build ${COMPOSE_SERVICES} 2>&1 | sed 's/^/   /' || err "docker compose up -d --build не удался"
     else
         err "docker-compose.yml не найден в $INSTALL_DIR"
     fi
@@ -389,7 +472,9 @@ elif [ "$SKIP_RESTART" = true ]; then
 else
     log "${BLUE}🔄 Шаг 7/9: перезапуск контейнеров...${NC}"
     cd "$INSTALL_DIR"
-    docker compose up -d 2>&1 | sed 's/^/   /' || log "${YELLOW}   ⚠️ docker compose up -d не удался"
+    # v4.71.2: тот же guard — при новом теге NocoDB в compose не пересоздаём её.
+    detect_nocodb_image_pending
+    docker compose up -d ${COMPOSE_SERVICES} 2>&1 | sed 's/^/   /' || log "${YELLOW}   ⚠️ docker compose up -d не удался"
     # v4.46.0 (боевой кейс): дельты пишут схему НАПРЯМУЮ в sqlite (SKIP_RESTART=1),
     # а NocoDB держит метаданные в памяти → без рестарта новые колонки «не видны»
     # в UI/API (симптом: галочка «Отправка документов» не появилась). docker compose
